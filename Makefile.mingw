@@ -1,0 +1,38 @@
+CC64 := x86_64-w64-mingw32-gcc
+
+LOADER_CFLAGS := -fno-toplevel-reorder -fno-builtin -fpack-struct=8 -fPIC -O1 -nostdlib
+LOADER_SRCS   := loader/loader.c loader/depack.c loader/clib.c hash.c encrypt.c
+
+fritter: clean
+	$(info ###### RELEASE ######)
+	$(CC64) -I include loader/exe2h/exe2h.c loader/exe2h/mmap-windows.c -lshlwapi -oexe2h.exe
+
+	$(CC64) -DPEB_WALK_ORDER=1 $(LOADER_CFLAGS) $(LOADER_SRCS) -I include -oloader_peb1.exe
+	./exe2h loader_peb1.exe
+
+	$(CC64) -DPEB_WALK_ORDER=2 $(LOADER_CFLAGS) $(LOADER_SRCS) -I include -oloader_peb2.exe
+	./exe2h loader_peb2.exe
+
+	$(CC64) $(LOADER_CFLAGS) loader/veh_shim.c -I include -oveh_shim.exe
+	./exe2h veh_shim.exe
+
+	$(CC64) -Wall -Os -s -fpack-struct=8 -DFRITTER_EXE -I include fritter.c hash.c encrypt.c format.c loader/clib.c lib/aplib64.lib -ofritter.exe
+debug: clean
+	$(info ###### DEBUG ######)
+	$(CC64) -I include loader/exe2h/exe2h.c loader/exe2h/mmap-windows.c -lshlwapi -oexe2h.exe
+
+	$(CC64) -DPEB_WALK_ORDER=1 $(LOADER_CFLAGS) $(LOADER_SRCS) -I include -oloader_peb1.exe
+	./exe2h loader_peb1.exe
+
+	$(CC64) -DPEB_WALK_ORDER=2 $(LOADER_CFLAGS) $(LOADER_SRCS) -I include -oloader_peb2.exe
+	./exe2h loader_peb2.exe
+
+	$(CC64) $(LOADER_CFLAGS) loader/veh_shim.c -I include -oveh_shim.exe
+	./exe2h veh_shim.exe
+
+	$(CC64) -DCLIB -Wno-format -fpack-struct=8 -DDEBUG -I include loader/loader.c hash.c encrypt.c loader/depack.c loader/clib.c -oloader64.exe -lole32 -lshlwapi
+	$(CC64) -Wall -Wno-format -fpack-struct=8 -DDEBUG -DFRITTER_EXE -I include fritter.c hash.c encrypt.c format.c loader/clib.c lib/aplib64.lib -ofritter.exe
+	$(CC64) -Wall loader/inject.c -oinject64.exe
+	$(CC64) -Wall loader/inject_local.c -oinject_local64.exe
+clean:
+	rm -f exe2h exe2h.exe loader.bin instance fritter.o hash.o encrypt.o format.o clib.o hash encrypt fritter hash.exe encrypt.exe fritter.exe lib/libfritter.a lib/libfritter.so loader.exe loader32.exe loader64.exe inject32.exe inject64.exe inject_local32.exe inject_local64.exe loader_peb1.exe loader_peb2.exe loader_peb1_exe_x64.h loader_peb2_exe_x64.h veh_shim.exe veh_shim_exe_x64.h veh_shim_exe_x64.go

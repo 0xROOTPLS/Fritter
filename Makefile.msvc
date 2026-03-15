@@ -1,0 +1,56 @@
+fritter: clean
+	@echo ###### Building exe2h ######
+	cl /nologo loader\exe2h\exe2h.c loader\exe2h\mmap-windows.c
+
+	@echo ###### Building loader (PEB order 1) ######
+	cl -Zp8 -c -nologo -Gy -Os -O1 -GR- -EHa -Oi -GS- -DPEB_WALK_ORDER=1 -I include loader\loader.c hash.c encrypt.c loader\depack.c loader\clib.c
+	link -nologo -order:@loader\order.txt -entry:FritterLoader -fixed -subsystem:console -nodefaultlib -out:loader_peb1.exe loader.obj hash.obj encrypt.obj depack.obj clib.obj
+	exe2h loader_peb1.exe
+
+	@echo ###### Building loader (PEB order 2) ######
+	cl -Zp8 -c -nologo -Gy -Os -O1 -GR- -EHa -Oi -GS- -DPEB_WALK_ORDER=2 -I include loader\loader.c hash.c encrypt.c loader\depack.c loader\clib.c
+	link -nologo -order:@loader\order.txt -entry:FritterLoader -fixed -subsystem:console -nodefaultlib -out:loader_peb2.exe loader.obj hash.obj encrypt.obj depack.obj clib.obj
+	exe2h loader_peb2.exe
+
+	@echo ###### Building VEH shim ######
+	cl -Zp8 -c -nologo -Gy -Os -O1 -GR- -EHa -Oi -GS- -I include loader\veh_shim.c
+	link -nologo -entry:VehShimEntry -fixed -subsystem:console -nodefaultlib -out:veh_shim.exe veh_shim.obj
+	exe2h veh_shim.exe
+
+	@echo ###### Building generator ######
+	cl -Zp8 -DFRITTER_EXE -I include fritter.c hash.c encrypt.c format.c loader\clib.c lib\aplib64.lib -Fe:fritter.exe
+	cl -Zp8 -nologo -DDLL -LD -I include fritter.c hash.c encrypt.c format.c loader\clib.c lib\aplib64.lib -Fe:fritter.dll
+	move fritter.lib lib\fritter.lib
+	move fritter.exp lib\fritter.exp
+	move fritter.dll lib\fritter.dll
+
+debug: clean
+	cl /nologo loader\exe2h\exe2h.c loader\exe2h\mmap-windows.c
+
+	cl -Zp8 -c -nologo -Gy -Os -O1 -GR- -EHa -Oi -GS- -DPEB_WALK_ORDER=1 -I include loader\loader.c hash.c encrypt.c loader\depack.c loader\clib.c
+	link -nologo -order:@loader\order.txt -entry:FritterLoader -fixed -subsystem:console -nodefaultlib -out:loader_peb1.exe loader.obj hash.obj encrypt.obj depack.obj clib.obj
+	exe2h loader_peb1.exe
+
+	cl -Zp8 -c -nologo -Gy -Os -O1 -GR- -EHa -Oi -GS- -DPEB_WALK_ORDER=2 -I include loader\loader.c hash.c encrypt.c loader\depack.c loader\clib.c
+	link -nologo -order:@loader\order.txt -entry:FritterLoader -fixed -subsystem:console -nodefaultlib -out:loader_peb2.exe loader.obj hash.obj encrypt.obj depack.obj clib.obj
+	exe2h loader_peb2.exe
+
+	cl -Zp8 -c -nologo -Gy -Os -O1 -GR- -EHa -Oi -GS- -I include loader\veh_shim.c
+	link -nologo -entry:VehShimEntry -fixed -subsystem:console -nodefaultlib -out:veh_shim.exe veh_shim.obj
+	exe2h veh_shim.exe
+
+	cl -Zp8 -nologo -DDEBUG -c -nologo -Gy -Os -EHa -GS- -I include loader\loader.c hash.c encrypt.c loader\depack.c loader\clib.c
+	link -nologo -order:@loader\order.txt -subsystem:console loader.obj hash.obj encrypt.obj depack.obj clib.obj
+
+	cl -Zp8 -nologo -DDEBUG -DFRITTER_EXE -I include fritter.c hash.c encrypt.c format.c loader\clib.c lib\aplib64.lib -Fe:fritter.exe
+	cl -Zp8 -nologo -DDEBUG -DDLL -LD -I include fritter.c hash.c encrypt.c format.c loader\clib.c lib\aplib64.lib -Fe:fritter.dll
+	move fritter.lib lib\fritter.lib
+	move fritter.exp lib\fritter.exp
+	move fritter.dll lib\fritter.dll
+
+hash:
+	cl -Zp8 -nologo -DTEST -I include hash.c loader\clib.c
+encrypt:
+	cl -Zp8 -nologo -DTEST -I include encrypt.c
+clean:
+	@del /Q mmap-windows.obj fritter.obj hash.obj encrypt.obj depack.obj format.obj clib.obj veh_shim.obj exe2h.exe loader.exe loader_peb1.exe loader_peb2.exe loader_peb1_exe_x64.h loader_peb2_exe_x64.h veh_shim.exe veh_shim_exe_x64.h hash.exe encrypt.exe fritter.exe lib\fritter.lib lib\fritter.exp lib\fritter.dll 2>nul
