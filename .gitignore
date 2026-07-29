@@ -48,6 +48,10 @@ lib/fritter.exp
 # Release artifact directory (Makefile.linux `release` target)
 dist/
 
+# Design prototype build artifacts
+docs/design/prototype/*.exe
+docs/design/prototype/*.obj
+
 # Internal audit reports — kept on disk, deliberately never entered into git
 # history so the decision to publish them stays open.
 Review/
