@@ -1,0 +1,80 @@
+# Fritter — Linux build (static-musl ELF)
+#
+# Produces a self-contained x86_64 Linux orchestrator that runs on any
+# modern distro without runtime libc dependencies. The loader payload is
+# still Windows PE shellcode (cross-compiled via mingw-w64).
+#
+# Requires (on Ubuntu/Debian): build-essential, mingw-w64, musl-tools
+
+CC            := gcc
+MUSL          := musl-gcc
+MINGW         := x86_64-w64-mingw32-gcc
+
+LOADER_CFLAGS := -fno-toplevel-reorder -fno-builtin -fpack-struct=8 -fPIC -O1 -nostdlib
+LOADER_SRCS   := loader/loader.c loader/depack.c loader/clib.c hash.c encrypt.c
+
+FRITTER_SRCS  := fritter.c hash.c encrypt.c format.c loader/clib.c
+APLIB         := lib/aplib_linux64.a
+
+FRITTER_CFLAGS := -static -Wall -Os -s -fpack-struct=8 -DFRITTER_EXE \
+                  -Wno-format-truncation
+FRITTER_LDFLAGS := -Wl,-z,noexecstack
+
+fritter: clean
+	$(info ###### LINUX RELEASE ######)
+	$(CC) tools/gen_poly.c -o gen_poly
+	./gen_poly include/poly_seed.h
+
+	$(CC) tools/gen_api_shuffle.c -o gen_api_shuffle
+	./gen_api_shuffle include/api_master.h include/api_shuffle.h
+
+	$(CC) -I include loader/exe2h/exe2h.c -o exe2h
+
+	$(MINGW) -DPEB_WALK_ORDER=1 $(LOADER_CFLAGS) $(LOADER_SRCS) -I include -o loader_peb1.exe
+	./exe2h loader_peb1.exe
+
+	$(MINGW) -DPEB_WALK_ORDER=2 $(LOADER_CFLAGS) $(LOADER_SRCS) -I include -o loader_peb2.exe
+	./exe2h loader_peb2.exe
+
+	$(MINGW) $(LOADER_CFLAGS) loader/veh_shim.c -I include -o veh_shim.exe
+	./exe2h veh_shim.exe
+
+	$(MUSL) $(FRITTER_CFLAGS) -I include $(FRITTER_SRCS) $(APLIB) $(FRITTER_LDFLAGS) -o fritter
+
+debug: clean
+	$(info ###### LINUX DEBUG ######)
+	$(CC) tools/gen_poly.c -o gen_poly
+	./gen_poly include/poly_seed.h
+
+	$(CC) tools/gen_api_shuffle.c -o gen_api_shuffle
+	./gen_api_shuffle include/api_master.h include/api_shuffle.h
+
+	$(CC) -I include loader/exe2h/exe2h.c -o exe2h
+
+	$(MINGW) -DPEB_WALK_ORDER=1 $(LOADER_CFLAGS) $(LOADER_SRCS) -I include -o loader_peb1.exe
+	./exe2h loader_peb1.exe
+
+	$(MINGW) -DPEB_WALK_ORDER=2 $(LOADER_CFLAGS) $(LOADER_SRCS) -I include -o loader_peb2.exe
+	./exe2h loader_peb2.exe
+
+	$(MINGW) $(LOADER_CFLAGS) loader/veh_shim.c -I include -o veh_shim.exe
+	./exe2h veh_shim.exe
+
+	$(MUSL) -static -Wall -Wno-format -fpack-struct=8 -DDEBUG -DFRITTER_EXE \
+	    -I include $(FRITTER_SRCS) $(APLIB) $(FRITTER_LDFLAGS) -o fritter
+
+release: fritter
+	$(info ###### LINUX RELEASE ARTIFACT ######)
+	mkdir -p dist
+	cp fritter dist/fritter-linux-x64
+	cd dist && sha256sum fritter-linux-x64 > fritter-linux-x64.sha256
+	@echo
+	@ls -lh dist/fritter-linux-x64
+	@cat dist/fritter-linux-x64.sha256
+
+clean:
+	rm -rf dist
+	rm -f exe2h gen_poly gen_api_shuffle include/poly_seed.h include/api_shuffle.h fritter loader.bin instance \
+	      loader_peb1.exe loader_peb2.exe veh_shim.exe \
+	      loader_peb1_exe_x64.h loader_peb2_exe_x64.h veh_shim_exe_x64.h \
+	      loader_peb1_exe_x64.go loader_peb2_exe_x64.go veh_shim_exe_x64.go

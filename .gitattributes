@@ -1,0 +1,14 @@
+# The tree is LF throughout. Pin it so Windows checkouts don't rewrite to CRLF —
+# _smoke.sh and the Makefiles run under WSL, where CRLF breaks them outright.
+* text=auto eol=lf
+
+*.sh      text eol=lf
+Makefile* text eol=lf
+
+# Never touch binaries
+*.bin binary
+*.exe binary
+*.dll binary
+*.a   binary
+*.lib binary
+*.obj binary
