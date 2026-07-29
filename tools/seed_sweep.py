@@ -307,7 +307,7 @@ def main():
     args = ap.parse_args()
 
     if not INJECT_EXE.exists():
-        print(f"ERROR: {INJECT_EXE} not found. Build it with Makefile.mingw first.")
+        print(f"ERROR: {INJECT_EXE} not found. Build it with: nmake /f Makefile.msvc harness")
         sys.exit(1)
 
     lo, hi = args.seed_range
