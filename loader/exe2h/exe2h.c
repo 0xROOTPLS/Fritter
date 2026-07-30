@@ -161,7 +161,7 @@ void bin2h(void *map, char *fname, void *bin, uint32_t len) {
 #else
     str = basename(fname);
 #endif
-    for(i=0; str[i] != 0 && i < 16;i++) {
+    for(i=0; str[i] != 0 && i < 24;i++) {
       if(str[i] == '.') {
         file[i] = label[i] = '_';
       } else {
@@ -205,7 +205,7 @@ void bin2go(void* map, char* fname, void* bin, uint32_t len) {
 #else
 	str = basename(fname);
 #endif
-	for (i = 0; str[i] != 0 && i < 16; i++) {
+	for (i = 0; str[i] != 0 && i < 24; i++) {
 		if (str[i] == '.') {
 			file[i] = label[i] = '_';
 		}
@@ -253,7 +253,7 @@ void bin2array(void *map, char *fname, void *bin, uint32_t len) {
 #else
     str = basename(fname);
 #endif
-    for(i=0; str[i] != 0 && i < 16;i++) {
+    for(i=0; str[i] != 0 && i < 24;i++) {
       if(str[i] == '.') {
         file[i] = label[i] = '_';
       } else {
