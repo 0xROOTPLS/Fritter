@@ -1,8 +1,32 @@
 # Function-Granular Dispatch — Design Proposal
 
-**Status:** proposal / draft
-**Date:** 2026-07-29
-**Supersedes if adopted:** the VEH sliding window in `loader/veh_shim.c`
+**Status:** v1 (whole-loader, N=1) SHIPPED 2026-07-30. Per-function
+(N>1) is the follow-up — see "Phase-3 v1 landing" below.
+**Date:** 2026-07-29 (original), 2026-07-30 (v1 shipped)
+**Supersedes:** the VEH sliding window in `loader/veh_shim.c`
+(retained in-tree, no longer built by the pipeline).
+
+## Phase-3 v1 landing (2026-07-30)
+
+- `loader/dispatch_shim.c` replaces `loader/veh_shim.c` in the PIC blob.
+- Fn table located by 8-byte marker in shim data; fritter populates
+  count + entries at build time. Design supports N>1 without shim
+  code changes.
+- v1 ships N=1 (single entry covers whole loader with one XOR key).
+  Per-function granularity is the natural next step and is unblocked:
+  MSVC per-function sections DO survive the linker (verified 6 code
+  sections: `.text`, `.hash_ch`, `.main_pr`, `.ansi2un`, `.cipher`,
+  `.aP_depa`, plus a 55-ref packer output). The "linker merge" concern
+  earlier in this doc was on a stale build artifact.
+- Sentinels retained: `SENTINEL_LOADER_OFFSET`, `SENTINEL_LOADER_SIZE`.
+  Retired: `SENTINEL_VEH_MODE`, `SENTINEL_PAGE_KEY_HI/LO`.
+- `-g/--chunked` CLI flag kept for compat but deprecated.
+
+**Validation:** `tools/seed_sweep.py --count 5 --seed-range 1 5`
+- MSVC: 5/5 pop, avg 0.47s
+- gcc:  5/5 pop, avg 0.39s
+- Prior VEH-era MSVC/gcc gap (~11x) is closed. Both toolchains now
+  hit the same ~0.4s wall — the actual cost of the loader running.
 
 ## Motivation
 
