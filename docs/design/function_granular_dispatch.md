@@ -129,6 +129,35 @@ Compile-time because these are baked into machine code:
 | maru → Memset hot loop (1600×)    | ~320ms         | ~8μs (Memset resident)|
 | Cross-page loop in ANY function   | multi-second   | N/A                   |
 
+## Phase-2 answers (2026-07-30)
+
+Read `pack.h`, `veh_shim.c`, `loader.c`, `peb.h` end-to-end and built
+an expanded prototype (`prototype/dispatch_v2.c`, commit 87307db).
+Three of the open questions below now have concrete answers:
+
+- **Concurrency:** single-threaded. `loader.c:77-128` shows the fork
+  model: `CreateThread(MainProc)` on a new thread, then the calling
+  thread `NtContinue`s out to the host's OEP. Exactly one thread is
+  in loader code at any time. First-cut integration needs no lock.
+
+- **`pack.h` reusability:** confirmed. `pack_ref_t` already records
+  every cross-section E8/E9/RIP-rel with source+target+disp_offset.
+  The rewrite loop at `pack.h:562-572` needs one surgical change —
+  point disps at per-callee thunk offsets instead of the callee's
+  new offset. Not new infrastructure.
+
+- **Indirect callbacks:** the only loader-side callback that matters
+  is `CreateThread(MainProc)` at `loader.c:77`. Solution: a resident
+  wrapper stub — Windows gets the wrapper's address, wrapper enters
+  dispatch to invoke encrypted MainProc. Prototype v2 demonstrates.
+  Windows APIs used by the embedded PE (TLS callbacks, thread starts)
+  target the embedded PE itself, not the loader — no constraint on
+  us.
+
+Still open: dispatch metadata format (fixed table vs inlined at call
+site), recursion, and the assembly thunks + return-address caller-ID
+lookup. All are for phase 3.
+
 ## Open questions
 
 Each needs an answer before implementation.
