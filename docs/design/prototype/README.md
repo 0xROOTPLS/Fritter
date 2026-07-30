@@ -80,6 +80,57 @@ sizes differ (gcc emits tighter code than MSVC's `/Od`).
 | MSVC 14.44 (/Od)        | 48 | 32 | PASS |
 | gcc mingw-w64 (-O0)     | 41 | 14 | PASS |
 
+## v2 — expanded prototype (2026-07-30)
+
+`dispatch_v2.c` extends v1 with the mechanics phase 3 needs before
+touching the real loader:
+
+- **Five functions**, not two, with a mixed protected/resident partition
+- **Deeper chain** — `fn_A → fn_B → fn_C` exercises three-level dispatch
+- **Branching** — `fn_A` also calls resident `fn_D` in the same body
+- **Resident short-circuit** — `fn_D` is marked resident; dispatch to
+  it skips all crypt ops and calls directly
+- **Wrapper pattern** — `entry_wrapper_A` is a resident stub that
+  enters dispatch to invoke protected `fn_A`. This is the fix for
+  `loader.c:77` handing `MainProc` to `CreateThread` — the wrapper
+  is what Windows gets, `MainProc` itself stays encrypted
+- **Invariant check across all cases** — max concurrent protected
+  plaintext must stay ≤ 1 through arbitrary call chains
+
+Build (both toolchains):
+
+    cl /Od /nologo dispatch_v2.c
+    x86_64-w64-mingw32-gcc -O0 -fno-toplevel-reorder dispatch_v2.c \
+      -o dispatch_v2_gcc.exe
+
+Results (2026-07-30):
+
+| Toolchain              | Tests | Max protected plain | Result |
+|------------------------|-------|--------------------:|--------|
+| MSVC 14.44 (/Od)       | 3/3   | 1                   | PASS   |
+| gcc mingw-w64 (-O0)    | 3/3   | 1                   | PASS   |
+
+## What v2 does NOT demonstrate
+
+Two remaining pieces still need proving before real integration:
+
+- **Return-address-based caller identification.** Both prototypes
+  pass `caller_id` explicitly. Real integration derives it from
+  `_ReturnAddress()` on the dispatcher plus a sorted-address table
+  lookup. Needs an assembly thunk (a `jmp dispatcher` after setting
+  `r11 = callee_id`), because a C thunk would push its own return
+  address and dispatcher would see the wrong caller.
+
+- **pack.h call-site rewriting.** `pack.h`'s existing displacement
+  rewriter (walks every E8/E9/RIP-rel disp, records source and
+  target) needs a modification to point those disps at per-callee
+  thunks instead of the callee's new offset. A ~30-line change to
+  `pack_extract`, but not yet prototyped.
+
+Everything else the real loader needs — multi-function correctness,
+deep chains, resident partition, callback-safe wrapper — is proven
+by v2 across both toolchains.
+
 ## What this does NOT demonstrate
 
 Everything the design doc's "Open questions" section names is out of
