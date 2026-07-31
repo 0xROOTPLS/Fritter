@@ -484,9 +484,16 @@ static void pack_search(int *cur, int depth, int n, int *used,
 }
 
 /* Main packer entry. Returns malloced packed blob and sets *out_size,
-   or NULL on failure (caller falls back to NOP-fill extraction). */
+   or NULL on failure (caller falls back to NOP-fill extraction).
+
+   out_refs / out_n_refs (optional, pass NULL to discard): on success,
+   the caller receives ownership of a malloced pack_ref_t[] recording
+   every cross-section RIP-rel/REL32 fixup applied to the blob. Used
+   by exe2h to emit the ref_table companion header for fritter's thunk
+   generation. Caller must free(*out_refs). */
 static uint8_t *pack_extract(const uint8_t *map, pack_sec_t *sections, int n_sec,
-                             uint32_t *out_size)
+                             uint32_t *out_size,
+                             pack_ref_t **out_refs, int *out_n_refs)
 {
   pack_ref_t *refs = NULL;
   int n_refs = 0, cap_refs = 0;
@@ -572,7 +579,12 @@ static uint8_t *pack_extract(const uint8_t *map, pack_sec_t *sections, int n_sec
   }
 
   *out_size = best_size;
-  free(refs);
+  if(out_refs != NULL && out_n_refs != NULL) {
+    *out_refs = refs;
+    *out_n_refs = n_refs;
+  } else {
+    free(refs);
+  }
   return blob;
 }
 
