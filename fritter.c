@@ -1077,6 +1077,193 @@ static int save_loader(PFRITTER_CONFIG c) {
     return err;
 }
 
+/* ============================================================
+ * Function-granular dispatch: opcode emitters
+ * ============================================================
+ *
+ * These helpers emit the byte sequences fritter appends to the tail
+ * of the loader blob when N>1 per-function dispatch is engaged:
+ *
+ *   [loader_original][dispatcher_bytes][thunk_0]..[thunk_N-1]
+ *
+ * The dispatcher and thunks are RESIDENT (plaintext at runtime); the
+ * shim's runtime fn_table has one resident entry covering their span
+ * so the shim's decrypt loop skips them. Cross-section calls in the
+ * loader are rewritten so their disp32 targets a thunk; each thunk
+ * loads r10=target_blob_off, r11=callee_id, and tail-jumps to the
+ * dispatcher, which decrypts the callee, calls it, and re-encrypts.
+ *
+ * MS x64 ABI is preserved end-to-end: caller's args reach the callee
+ * in rcx/rdx/r8/r9 unchanged, rax returns; r10/r11 are volatile so
+ * their use as dispatch metadata carriers is ABI-legal.
+ *
+ * All opcodes below hand-verified against Intel SDM Vol 2.
+ */
+
+#define THUNK_SIZE 17u  /* mov r10d,imm32; mov r11d,imm32; jmp rel32 = 6+6+5 */
+
+/* Emit one thunk into `out`. Returns bytes written (== THUNK_SIZE).
+ *   target_blob_off — where within the loader blob the callee's
+ *                     specific entry point lives (loader-base-relative).
+ *   callee_id       — index into the runtime fn_table.
+ *   dispatcher_rel  — signed rel32 from end-of-jmp to dispatcher entry.
+ *                     Positive if dispatcher precedes... actually
+ *                     dispatcher is BEFORE thunks in blob order
+ *                     ([loader][dispatcher][thunks]) so this is
+ *                     always negative.
+ */
+static uint32_t emit_thunk(uint8_t *out,
+                           uint32_t target_blob_off,
+                           uint32_t callee_id,
+                           int32_t  dispatcher_rel)
+{
+    uint8_t *p = out;
+    /* mov r10d, target_blob_off (41 BA imm32) */
+    *p++ = 0x41; *p++ = 0xBA;
+    memcpy(p, &target_blob_off, 4); p += 4;
+    /* mov r11d, callee_id (41 BB imm32) */
+    *p++ = 0x41; *p++ = 0xBB;
+    memcpy(p, &callee_id, 4); p += 4;
+    /* jmp rel32 (E9 disp32) */
+    *p++ = 0xE9;
+    memcpy(p, &dispatcher_rel, 4); p += 4;
+    return (uint32_t)(p - out);
+}
+
+/* Emit the dispatcher into `out`. Returns bytes written.
+ *   self_off  — dispatcher's own blob offset (relative to combined blob start,
+ *               which is where LEA rip+disp arithmetic will land)
+ *   loader_off  — loader region's blob offset (= shim_padded_size)
+ *   ft_off      — fn_table_area's blob offset (marker-relative, inside shim)
+ *
+ * ABI on entry (from thunk tail-jmp):
+ *   r10 = target_blob_off (loader-blob-relative callee entry point)
+ *   r11 = callee_id (index into fn_table)
+ *   rcx/rdx/r8/r9 = callee's args (must reach callee untouched)
+ *   [rsp] = caller's post-CALL return address
+ *
+ * Frame layout after prologue (rsp-relative):
+ *   [+0x00..+0x1F] shadow space for the callee we CALL
+ *   [+0x20..+0x27] spilled rcx
+ *   [+0x28..+0x2F] spilled rdx
+ *   [+0x30..+0x37] spilled r8
+ *   [+0x38..+0x3F] spilled r9
+ *   [+0x40..+0x47] rax save (callee's return value across re-encrypt)
+ *   [+0x48..+0x5F] pad
+ */
+static uint32_t emit_dispatcher(uint8_t *out,
+                                uint32_t self_off,
+                                uint32_t loader_off,
+                                uint32_t ft_off)
+{
+    uint8_t *p = out;
+    #define D_OFF() ((uint32_t)(p - out))
+    #define RIP_DISP32(target_off) do { \
+        int32_t _d = (int32_t)(target_off) - (int32_t)(self_off + D_OFF() + 4); \
+        memcpy(p, &_d, 4); p += 4; \
+    } while(0)
+
+    /* --- Prologue: save nonvolatile regs we'll use --- */
+    *p++ = 0x53;                                    /* push rbx      */
+    *p++ = 0x56;                                    /* push rsi      */
+    *p++ = 0x57;                                    /* push rdi      */
+    *p++ = 0x41; *p++ = 0x54;                       /* push r12      */
+    *p++ = 0x41; *p++ = 0x55;                       /* push r13      */
+    *p++ = 0x41; *p++ = 0x56;                       /* push r14      */
+    *p++ = 0x41; *p++ = 0x57;                       /* push r15      */
+    /* Stack now: [caller ret][rbx][rsi][rdi][r12][r13][r14][r15]    */
+    /* rsp was 8 mod 16 on entry (from CALL), 7 pushes → 0 mod 16    */
+
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x60;  /* sub rsp, 0x60 */
+
+    /* --- Spill arg regs into frame --- */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20; /* mov [rsp+0x20], rcx */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x54; *p++ = 0x24; *p++ = 0x28; /* mov [rsp+0x28], rdx */
+    *p++ = 0x4C; *p++ = 0x89; *p++ = 0x44; *p++ = 0x24; *p++ = 0x30; /* mov [rsp+0x30], r8  */
+    *p++ = 0x4C; *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x38; /* mov [rsp+0x38], r9  */
+
+    /* --- Locate fn_table entry: rsi = &fn_table_area[16 + id*12] --- */
+    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x35;          /* lea rsi, [rip+ft_disp] */
+    RIP_DISP32(ft_off);
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC6; *p++ = 0x10;  /* add rsi, 16 (skip marker+count+pad) */
+
+    *p++ = 0x45; *p++ = 0x89; *p++ = 0xDC;          /* mov r12d, r11d (callee_id → r12) */
+    *p++ = 0x4D; *p++ = 0x6B; *p++ = 0xE4; *p++ = 0x0C;  /* imul r12, r12, 12 (entry size) */
+    *p++ = 0x49; *p++ = 0x01; *p++ = 0xF4;          /* add r12, rsi (r12 = &entries[id]) */
+
+    /* --- Load fn_entry fields into nonvolatile regs --- */
+    *p++ = 0x45; *p++ = 0x8B; *p++ = 0x2C; *p++ = 0x24;              /* mov r13d, [r12]    (offset) */
+    *p++ = 0x45; *p++ = 0x8B; *p++ = 0x74; *p++ = 0x24; *p++ = 0x04; /* mov r14d, [r12+4]  (size)   */
+    *p++ = 0x45; *p++ = 0x0F; *p++ = 0xB6; *p++ = 0x7C; *p++ = 0x24; *p++ = 0x08; /* movzx r15d, byte [r12+8] (key) */
+
+    /* --- Compute loader_base into r12 (reuse — done with fn_entry ptr) --- */
+    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x05;          /* lea rax, [rip+lb_disp] */
+    RIP_DISP32(loader_off);
+    *p++ = 0x49; *p++ = 0x89; *p++ = 0xC4;          /* mov r12, rax (loader_base) */
+
+    /* --- XOR-decrypt callee region: rdi = base = loader_base + fn_entry.offset --- */
+    *p++ = 0x4C; *p++ = 0x01; *p++ = 0xE8;          /* add rax, r13 (loader_base + offset) */
+    /* r13 is 32-bit clean (upper zeroed by earlier mov r13d). Adding a full
+       64-bit reg is fine — high 32 bits are 0. */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0xC7;          /* mov rdi, rax (save decrypt base) */
+    *p++ = 0x44; *p++ = 0x89; *p++ = 0xF1;          /* mov ecx, r14d (counter) */
+
+    /* loop1: xor [rax], r15b; inc rax; dec ecx; jnz loop1 */
+    uint32_t loop1_start = D_OFF();
+    *p++ = 0x44; *p++ = 0x30; *p++ = 0x38;          /* xor [rax], r15b */
+    *p++ = 0x48; *p++ = 0xFF; *p++ = 0xC0;          /* inc rax */
+    *p++ = 0xFF; *p++ = 0xC9;                       /* dec ecx */
+    *p++ = 0x75;
+    *p++ = (uint8_t)(int8_t)((int32_t)loop1_start - (int32_t)(D_OFF() + 1));
+
+    /* --- Restore args and call callee at loader_base + r10 --- */
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20; /* mov rcx, [rsp+0x20] */
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24; *p++ = 0x28; /* mov rdx, [rsp+0x28] */
+    *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x30; /* mov r8,  [rsp+0x30] */
+    *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x38; /* mov r9,  [rsp+0x38] */
+
+    /* Compute callee entry: rax = loader_base + r10 (target_blob_off) */
+    *p++ = 0x4C; *p++ = 0x89; *p++ = 0xE0;          /* mov rax, r12 (loader_base) */
+    *p++ = 0x4C; *p++ = 0x01; *p++ = 0xD0;          /* add rax, r10 (+ target offset) */
+    *p++ = 0xFF; *p++ = 0xD0;                       /* call rax */
+
+    /* Save return value */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x44; *p++ = 0x24; *p++ = 0x40; /* mov [rsp+0x40], rax */
+
+    /* --- XOR-re-encrypt callee region using saved base (rdi) --- */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0xF8;          /* mov rax, rdi */
+    *p++ = 0x44; *p++ = 0x89; *p++ = 0xF1;          /* mov ecx, r14d */
+
+    uint32_t loop2_start = D_OFF();
+    *p++ = 0x44; *p++ = 0x30; *p++ = 0x38;          /* xor [rax], r15b */
+    *p++ = 0x48; *p++ = 0xFF; *p++ = 0xC0;          /* inc rax */
+    *p++ = 0xFF; *p++ = 0xC9;                       /* dec ecx */
+    *p++ = 0x75;
+    *p++ = (uint8_t)(int8_t)((int32_t)loop2_start - (int32_t)(D_OFF() + 1));
+
+    /* Restore rax (callee's return value) */
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x40; /* mov rax, [rsp+0x40] */
+
+    /* --- Epilogue --- */
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x60; /* add rsp, 0x60 */
+    *p++ = 0x41; *p++ = 0x5F;                        /* pop r15 */
+    *p++ = 0x41; *p++ = 0x5E;                        /* pop r14 */
+    *p++ = 0x41; *p++ = 0x5D;                        /* pop r13 */
+    *p++ = 0x41; *p++ = 0x5C;                        /* pop r12 */
+    *p++ = 0x5F;                                     /* pop rdi */
+    *p++ = 0x5E;                                     /* pop rsi */
+    *p++ = 0x5B;                                     /* pop rbx */
+    *p++ = 0xC3;                                     /* ret     */
+
+    #undef D_OFF
+    #undef RIP_DISP32
+    return (uint32_t)(p - out);
+}
+
+/* Rough upper bound for the emitted dispatcher (used to reserve buffer
+   space). Actual size is closer to 180. */
+#define DISPATCHER_MAX_SIZE 256u
+
 /**
  * Function: build_loader
  * ----------------------------
