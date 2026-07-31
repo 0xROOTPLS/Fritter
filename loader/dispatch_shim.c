@@ -130,7 +130,16 @@ typedef void* (*LoaderEntry_fn)(void*);
 #define MAX_FN_COUNT        16
 
 /* FN_ENTRY - one per protected function. 12 bytes exactly.
-   flags bit 0: resident (skip crypt entirely). */
+   flags bit 0: RESIDENT — never encrypted at rest, no crypt work
+                by shim OR dispatcher (dispatcher fast-path calls directly).
+   flags bit 1: SHIM_DECRYPT — encrypted at rest, shim decrypts once at
+                entry (v1 whole-loader model). Not dispatcher-managed.
+                Under N>1 per-function dispatch, protected sections have
+                NEITHER flag: encrypted at rest, dispatcher decrypts on
+                each call and re-encrypts on return. */
+#define FN_FLAG_RESIDENT     0x01u
+#define FN_FLAG_SHIM_DECRYPT 0x02u
+
 typedef struct {
     uint32_t offset;
     uint32_t size;
@@ -239,11 +248,15 @@ void DispatchShimEntry(void *inst, void *shim_base) {
 
     if (!pVP((void*)first_page, protect_len, PAGE_EXECUTE_READWRITE, &old)) return;
 
-    /* Decrypt each non-resident entry in place. For N=1 (v1), this
-       is a single pass over the whole loader with one key. */
+    /* Decrypt each SHIM_DECRYPT entry in place. Under v1 whole-loader
+       dispatch, one entry covers the entire loader with FN_FLAG_SHIM_DECRYPT
+       set. Under N>1 per-function dispatch, no entries have this flag —
+       the dispatcher (living at the loader-blob tail) owns the crypt
+       cycle for every protected section on a per-call basis. */
     for (uint32_t i = 0; i < fn_count; i++) {
         FN_ENTRY *e = &fns[i];
-        if (e->flags & 0x1u) continue;  /* resident */
+        if (e->flags & FN_FLAG_RESIDENT) continue;
+        if (!(e->flags & FN_FLAG_SHIM_DECRYPT)) continue;
         if (e->size == 0) continue;
         shim_xor_region((uint8_t*)loader_base + e->offset, e->size, e->key);
     }

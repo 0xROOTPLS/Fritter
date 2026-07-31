@@ -1751,16 +1751,21 @@ static int build_loader(PFRITTER_CONFIG c) {
       // fn_count = 1
       uint32_t one = 1;
       memcpy(combined + ft_off + 8, &one, 4);
-      // entry[0]: offset=0, size=loader_size, key=fn_key, flags=0
+      // entry[0]: offset=0, size=loader_size, key=fn_key,
+      //          flags=SHIM_DECRYPT (0x2) — shim auto-decrypts the whole
+      //          loader region at entry (v1 whole-loader model). Under
+      //          forthcoming N>1 mode, protected entries have flags=0 and
+      //          the loader-tail dispatcher owns their crypt cycle.
       uint32_t e_off = 0, e_sz = loader_size;
+      uint8_t  e_flags = 0x02;  /* FN_FLAG_SHIM_DECRYPT */
       memcpy(combined + ft_off + 16 + 0, &e_off, 4);
       memcpy(combined + ft_off + 16 + 4, &e_sz,  4);
-      combined[ft_off + 16 + 8]  = fn_key;   // key
-      combined[ft_off + 16 + 9]  = 0x00;     // flags (bit 0=resident; 0=protected)
-      combined[ft_off + 16 + 10] = 0x00;     // pad
+      combined[ft_off + 16 + 8]  = fn_key;
+      combined[ft_off + 16 + 9]  = e_flags;
+      combined[ft_off + 16 + 10] = 0x00;
       combined[ft_off + 16 + 11] = 0x00;
-      DPRINT("Patched fn table: count=1 entry[0]={offset=0 size=%u key=0x%02X flags=0}",
-             loader_size, fn_key);
+      DPRINT("Patched fn table: count=1 entry[0]={offset=0 size=%u key=0x%02X flags=0x%02X}",
+             loader_size, fn_key, e_flags);
     }
 
     // Copy loader after padded shim, then XOR-encrypt the loader
