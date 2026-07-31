@@ -43,6 +43,7 @@
 #endif
 
 DWORD MainProc(PFRITTER_INSTANCE inst);
+DWORD MainProcEntry(PFRITTER_INSTANCE inst);
 
 /* FritterLoader is the PE entry and must be at .text+0 in the
    extracted blob. MSVC: pin to .text$a so /Gy COMDAT ordering puts it
@@ -74,7 +75,7 @@ HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
       if(_CreateThread != NULL) {
         // create new thread
         DPRINT("Creating new thread");
-        h = _CreateThread(NULL, 0, ADR(LPTHREAD_START_ROUTINE, MainProc), (LPVOID)inst, 0, NULL);
+        h = _CreateThread(NULL, 0, ADR(LPTHREAD_START_ROUTINE, MainProcEntry), (LPVOID)inst, 0, NULL);
       } else {
         DPRINT("FAILED");
         return (HANDLE)-1;
@@ -128,6 +129,18 @@ HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
       MainProc(inst);
     }
     return h;
+}
+
+/* Resident entry stub handed to CreateThread. Lives in .text so Windows
+   never calls encrypted bytes; body is a single cross-section call the
+   dispatch rewriter thunkifies, letting .main_proc be protected. */
+#ifdef _MSC_VER
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+DWORD MainProcEntry(PFRITTER_INSTANCE inst) {
+    return MainProc(inst);
 }
 
 LOADER_FN_SECTION(".main_proc")

@@ -1895,14 +1895,13 @@ static int build_loader(PFRITTER_CONFIG c) {
     uint32_t disp_slot  = 0;
     uint32_t thunks_size = 0;
     if(use_ngt1) {
-      /* Residency policy: .text (FritterLoader + untagged helpers) stays
-         resident because the shim jmps to its entry directly. .main_pr
-         stays resident because MainProc is handed to CreateThread as a
-         function pointer — Windows would call encrypted bytes otherwise.
-         A wrapper stub would let us protect .main_pr; deferred. */
+      /* Residency policy: only .text (FritterLoader + MainProcEntry +
+         untagged helpers) stays resident because the shim jmps to its
+         entry directly and Windows calls MainProcEntry via CreateThread.
+         .main_pr is now protected — MainProcEntry's cross-section call
+         to MainProc gets thunkified by the rewriter. */
       for(uint32_t i = 0; i < L_FN_COUNT; i++) {
-        if(strncmp(L_FNS[i].name, ".text",    5) == 0 ||
-           strncmp(L_FNS[i].name, ".main_pr", 8) == 0) {
+        if(strncmp(L_FNS[i].name, ".text", 5) == 0) {
           is_resident[i] = 1;
         }
       }
