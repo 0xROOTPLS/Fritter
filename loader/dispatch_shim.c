@@ -80,6 +80,25 @@
 #  define IN_TEXT_Z __attribute__((section(".text"), used))
 #endif
 
+/* IN_DISP pins the dispatcher into its own PE code section so exe2h's
+   multi-section path picks it up. Fritter then reads DISPATCH_SHIM_FNS[1]
+   from the shim's companion fn_table header to learn the dispatcher's
+   offset within the shim blob — no marker scan needed.
+   MSVC: .disp$a is a fresh code section (read+execute). gcc: named
+   attribute section, source-order-preserved by -fno-toplevel-reorder. */
+#ifdef _MSC_VER
+/* code_seg alone allocates .disp$a as a CODE section (IMAGE_SCN_CNT_CODE);
+   using #pragma section first would lock it in as data-with-execute, which
+   exe2h's IMAGE_SCN_CNT_CODE scan would miss.
+   Force retention: link-time dead-code elim would otherwise drop
+   DispatcherEntry (nothing in the shim calls it), collapsing .disp
+   back to zero. /INCLUDE keeps it. */
+#  define IN_DISP __declspec(code_seg(".disp$a"))
+#  pragma comment(linker, "/INCLUDE:DispatcherEntry")
+#else
+#  define IN_DISP __attribute__((section(".disp"), used))
+#endif
+
 /* API type aliases */
 typedef BOOL  (WINAPI *VP_fn)(LPVOID, SIZE_T, DWORD, PDWORD);
 typedef void* (*LoaderEntry_fn)(void*);
@@ -134,6 +153,21 @@ static int    shim_stricmp(const char *a, const char *b);
 static int    shim_strcmp(const char *a, const char *b);
 static void   shim_xor_region(uint8_t *base, uint32_t size, uint8_t key);
 static void   shim_wipe_region(uint8_t *base, uint32_t size, uint8_t byte);
+
+/* DispatcherEntry — placeholder in .disp so the section exists and
+ * exe2h reports its offset in DISPATCH_SHIM_FNS[1].
+ *
+ * The real dispatcher body is NOT reserved here. Fritter appends the
+ * dispatcher bytes at the tail of the packaged shim blob at build
+ * time (grows the blob by the dispatcher size, records the new offset
+ * for thunk targeting). This keeps the shim source compact and lets
+ * the dispatcher size vary per polymorphism seed later without
+ * touching source.
+ *
+ * A stray runtime jump into this stub is a no-op that returns cleanly. */
+IN_DISP void DispatcherEntry(void) {
+    return;
+}
 
 /* DispatchShimEntry - MUST be at .text+0. Entered via fallthrough
    from the XOR decoder. RCX = instance, RDX = shim base.
