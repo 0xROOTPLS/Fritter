@@ -1198,16 +1198,33 @@ static uint32_t emit_dispatcher(uint8_t *out,
         memcpy(p, &_d, 4); p += 4; \
     } while(0)
 
-    /* --- Prologue: save nonvolatile regs we'll use --- */
-    *p++ = 0x53;                                    /* push rbx      */
-    *p++ = 0x56;                                    /* push rsi      */
-    *p++ = 0x57;                                    /* push rdi      */
-    *p++ = 0x41; *p++ = 0x54;                       /* push r12      */
-    *p++ = 0x41; *p++ = 0x55;                       /* push r13      */
-    *p++ = 0x41; *p++ = 0x56;                       /* push r14      */
-    *p++ = 0x41; *p++ = 0x57;                       /* push r15      */
-    /* Stack now: [caller ret][rbx][rsi][rdi][r12][r13][r14][r15]    */
-    /* rsp was 8 mod 16 on entry (from CALL), 7 pushes → 0 mod 16    */
+    /* --- Prologue: save the 7 nonvolatiles we clobber, in random
+     * order per build. Pop order in the epilogue mirrors this array
+     * in reverse. Reg ids: 3=rbx, 6=rsi, 7=rdi, 12=r12, 13=r13,
+     * 14=r14, 15=r15. Total push bytes = 3*1 + 4*2 = 11 regardless
+     * of order, so frame layout after `sub rsp, 0x60` is unchanged.
+     * RSP: 8 mod 16 on entry (from CALL), 7 pushes → 0 mod 16. */
+    static const uint8_t NONVOL_REGS[7] = {3, 6, 7, 12, 13, 14, 15};
+    uint8_t save_order[7];
+    memcpy(save_order, NONVOL_REGS, 7);
+    {
+        uint8_t rnd_bytes[7];
+        gen_random(rnd_bytes, 7);
+        for(int i = 6; i > 0; i--) {
+            int j = rnd_bytes[i] % (i + 1);
+            uint8_t t = save_order[i];
+            save_order[i] = save_order[j];
+            save_order[j] = t;
+        }
+    }
+    for(int i = 0; i < 7; i++) {
+        uint8_t r = save_order[i];
+        if(r < 8) {
+            *p++ = 0x50 + r;              /* push r        (low-8)  */
+        } else {
+            *p++ = 0x41; *p++ = 0x50 + (r - 8); /* push r  (high-8)  */
+        }
+    }
 
     *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x60;  /* sub rsp, 0x60 */
 
@@ -1279,15 +1296,16 @@ static uint32_t emit_dispatcher(uint8_t *out,
     /* Restore rax (callee's return value) */
     *p++ = 0x48; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x40; /* mov rax, [rsp+0x40] */
 
-    /* --- Epilogue --- */
+    /* --- Epilogue: pop in reverse of the prologue's save_order --- */
     *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x60; /* add rsp, 0x60 */
-    *p++ = 0x41; *p++ = 0x5F;                        /* pop r15 */
-    *p++ = 0x41; *p++ = 0x5E;                        /* pop r14 */
-    *p++ = 0x41; *p++ = 0x5D;                        /* pop r13 */
-    *p++ = 0x41; *p++ = 0x5C;                        /* pop r12 */
-    *p++ = 0x5F;                                     /* pop rdi */
-    *p++ = 0x5E;                                     /* pop rsi */
-    *p++ = 0x5B;                                     /* pop rbx */
+    for(int i = 6; i >= 0; i--) {
+        uint8_t r = save_order[i];
+        if(r < 8) {
+            *p++ = 0x58 + r;              /* pop r         (low-8)  */
+        } else {
+            *p++ = 0x41; *p++ = 0x58 + (r - 8); /* pop r   (high-8)  */
+        }
+    }
     *p++ = 0xC3;                                     /* ret     */
 
     #undef D_OFF
