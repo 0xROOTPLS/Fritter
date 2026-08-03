@@ -1118,31 +1118,36 @@ static int save_loader(PFRITTER_CONFIG c) {
  *                     ([loader][dispatcher][thunks]) so this is
  *                     always negative.
  */
+/* Two independent per-build variations coordinate thunk with dispatcher:
+ *   input_swap == 0: r10 = target_blob_off, r11 = callee_id (canonical)
+ *   input_swap == 1: r11 = target_blob_off, r10 = callee_id (swapped)
+ * Both emit_thunk and emit_dispatcher receive the same input_swap so the
+ * two agree on which volatile scratch reg carries which value. */
 static uint32_t emit_thunk(uint8_t *out,
                            uint32_t target_blob_off,
                            uint32_t callee_id,
-                           int32_t  dispatcher_rel)
+                           int32_t  dispatcher_rel,
+                           int      input_swap)
 {
     uint8_t *p = out;
-    /* Randomize which mov comes first per callsite. Dispatcher reads
-       r10 and r11 as independent inputs, so ordering is free. Kills
-       the fixed 12-byte "41 BA .. .. .. .. 41 BB .. .. .. .." prefix
-       that would otherwise repeat verbatim across every thunk. */
+    /* Semantic role → mov opcode byte. r10 = 0xBA (mov r10d, imm32),
+       r11 = 0xBB. Swap flips which one holds which value. */
+    uint8_t target_op = input_swap ? 0xBB : 0xBA;
+    uint8_t id_op     = input_swap ? 0xBA : 0xBB;
+    /* Randomize which mov comes first per callsite (independent axis
+       from input_swap). Kills the fixed 12-byte prefix that would
+       otherwise repeat verbatim across every thunk. */
     uint8_t order;
     gen_random(&order, 1);
     if(order & 1) {
-        /* mov r11d, callee_id (41 BB imm32) */
-        *p++ = 0x41; *p++ = 0xBB;
+        *p++ = 0x41; *p++ = id_op;
         memcpy(p, &callee_id, 4); p += 4;
-        /* mov r10d, target_blob_off (41 BA imm32) */
-        *p++ = 0x41; *p++ = 0xBA;
+        *p++ = 0x41; *p++ = target_op;
         memcpy(p, &target_blob_off, 4); p += 4;
     } else {
-        /* mov r10d, target_blob_off (41 BA imm32) */
-        *p++ = 0x41; *p++ = 0xBA;
+        *p++ = 0x41; *p++ = target_op;
         memcpy(p, &target_blob_off, 4); p += 4;
-        /* mov r11d, callee_id (41 BB imm32) */
-        *p++ = 0x41; *p++ = 0xBB;
+        *p++ = 0x41; *p++ = id_op;
         memcpy(p, &callee_id, 4); p += 4;
     }
     /* jmp rel32 (E9 disp32) */
@@ -1175,9 +1180,18 @@ static uint32_t emit_thunk(uint8_t *out,
 static uint32_t emit_dispatcher(uint8_t *out,
                                 uint32_t self_off,
                                 uint32_t loader_off,
-                                uint32_t ft_off)
+                                uint32_t ft_off,
+                                int      input_swap)
 {
     uint8_t *p = out;
+    /* input_swap agrees with emit_thunk on which volatile scratch reg
+       carries which value:
+         swap==0: r10=target_off, r11=callee_id
+         swap==1: r11=target_off, r10=callee_id
+       Two dispatcher instructions below (`mov r12d, id_reg` and
+       `add rax, target_reg`) pick their ModR/M byte from this. */
+    uint8_t id_modrm     = input_swap ? 0xD4 : 0xDC; /* mov r12d, r10d or r11d */
+    uint8_t target_modrm = input_swap ? 0xD8 : 0xD0; /* add rax, r11 or r10   */
     #define D_OFF() ((uint32_t)(p - out))
     #define RIP_DISP32(target_off) do { \
         int32_t _d = (int32_t)(target_off) - (int32_t)(self_off + D_OFF() + 4); \
@@ -1208,7 +1222,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
     RIP_DISP32(ft_off);
     *p++ = 0x48; *p++ = 0x83; *p++ = 0xC6; *p++ = 0x10;  /* add rsi, 16 (skip marker+count+pad) */
 
-    *p++ = 0x45; *p++ = 0x89; *p++ = 0xDC;          /* mov r12d, r11d (callee_id → r12) */
+    *p++ = 0x45; *p++ = 0x89; *p++ = id_modrm;      /* mov r12d, <id_reg>d (callee_id → r12) */
     *p++ = 0x4D; *p++ = 0x6B; *p++ = 0xE4; *p++ = 0x0C;  /* imul r12, r12, 12 (entry size) */
     *p++ = 0x49; *p++ = 0x01; *p++ = 0xF4;          /* add r12, rsi (r12 = &entries[id]) */
 
@@ -1245,7 +1259,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
 
     /* Compute callee entry: rax = loader_base + r10 (target_blob_off) */
     *p++ = 0x4C; *p++ = 0x89; *p++ = 0xE0;          /* mov rax, r12 (loader_base) */
-    *p++ = 0x4C; *p++ = 0x01; *p++ = 0xD0;          /* add rax, r10 (+ target offset) */
+    *p++ = 0x4C; *p++ = 0x01; *p++ = target_modrm;  /* add rax, <target_reg> (+ target offset) */
     *p++ = 0xFF; *p++ = 0xD0;                       /* call rax */
 
     /* Save return value */
@@ -1910,6 +1924,7 @@ static int build_loader(PFRITTER_CONFIG c) {
     uint32_t disp_slot  = 0;
     uint32_t thunks_size = 0;
     uint32_t pre_disp_pad = 0;  /* random 0..63 bytes before dispatcher */
+    int      input_swap  = 0;   /* r10/r11 semantic role — thunk+dispatcher agree */
     if(use_ngt1) {
       /* Residency policy: only .text (FritterLoader + MainProcEntry +
          untagged helpers) stays resident because the shim jmps to its
@@ -1932,6 +1947,12 @@ static int build_loader(PFRITTER_CONFIG c) {
       uint8_t pad_rnd;
       gen_random(&pad_rnd, 1);
       pre_disp_pad = pad_rnd & 0x3F;
+      /* Per-build coin flip: which of r10/r11 carries target_off vs
+         callee_id. Kills the fixed "add rax, r10" / "mov r12d, r11d"
+         ModR/M bytes in the dispatcher. */
+      uint8_t swap_rnd;
+      gen_random(&swap_rnd, 1);
+      input_swap = swap_rnd & 1;
       DPRINT("N>1 dispatch: FN_COUNT=%u REF_COUNT=%u protected_refs=%u pre_disp_pad=%u disp_slot=%u thunks=%u",
              L_FN_COUNT, L_REF_COUNT, protected_ref_count, pre_disp_pad, disp_slot, thunks_size);
     }
@@ -2037,7 +2058,8 @@ static int build_loader(PFRITTER_CONFIG c) {
       uint32_t actual_disp_size = emit_dispatcher(combined + disp_off_in_blob,
                                                    disp_off_in_blob,
                                                    loader_off_in_blob,
-                                                   ft_off);
+                                                   ft_off,
+                                                   input_swap);
       if(actual_disp_size > DISPATCHER_MAX_SIZE) {
         DPRINT("ERROR: dispatcher emitted %u bytes > slot %u",
                actual_disp_size, DISPATCHER_MAX_SIZE);
@@ -2078,7 +2100,8 @@ static int build_loader(PFRITTER_CONFIG c) {
         emit_thunk(combined + thunk_off_in_blob,
                    target_blob_off,
                    L_REFS[r].target_fn,
-                   dispatcher_rel);
+                   dispatcher_rel,
+                   input_swap);
 
         // Rewrite the loader's disp32 so the original CALL/JMP now targets
         // this thunk. disp is loader-relative because both src and thunk
