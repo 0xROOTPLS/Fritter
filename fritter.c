@@ -1211,6 +1211,110 @@ static uint32_t emit_thunk(uint8_t *out,
     return (uint32_t)(p - out);
 }
 
+/* Emit one XOR-in-place loop that toggles a region with a byte key.
+ *
+ * Caller pre-loads:
+ *   rax = base address of region
+ *   r14 = size in bytes (upper 32 bits zero — comes from `mov r14d,...`)
+ *   r15 = byte key (in r15b)
+ *
+ * Per emission we randomize independently:
+ *   - counter register from the 6-way clobber-safe pool
+ *     {rcx, rdx, rbx, rsi, r8, r9}. rbp is deliberately excluded — the
+ *     dispatcher's NONVOL_REGS push list doesn't save it, so using it
+ *     as counter would corrupt the outer caller's rbp on return.
+ *     rax/rdi/r10-r15 are all live during the loop, so they're out too.
+ *   - direction: forward (inc rax) or reverse (dec rax, pre-loaded to
+ *     base+size-1). XOR is self-inverse per byte so direction is
+ *     independent per call — decrypt-forward + reencrypt-reverse (any
+ *     combination) leaves data intact.
+ *   - 0..4 bytes of NOP junk via emit_rnd_nop at 4 gap sites inside
+ *     the body, 50% skip per gap. NOPs from 0F 1F /r don't touch flags
+ *     so they are safe between `dec counter` and `jnz`.
+ *
+ * Post-loop:
+ *   rax, counter reg, and flags all clobbered — caller must restore
+ *   rax if needed (dispatcher reloads from rdi for loop2).
+ *
+ * Body size: mov counter (3) + xor (3) + inc/dec rax (3) + dec counter
+ * (2..3) + jnz rel8 (2) + up to 16 bytes junk + optional 6 bytes
+ * reverse setup = up to ~36 bytes per loop.
+ */
+static uint32_t emit_xor_loop(uint8_t *out) {
+    /* rex_b = REX.B extension needed for r8-r15; low3 = 3-bit rm/reg
+       field. mov source is always r14d (rex_r=1), so REX = 0x44 | rex_b
+       and mov ModR/M = 0xC0 | (6<<3) | low3. dec is FF opcode with
+       ModR/M = 0xC8 | low3, prefixed by 0x41 iff rex_b.
+       Excludes rbp (5): it's a nonvolatile that the dispatcher's
+       NONVOL_REGS push list DOES NOT save, so clobbering it corrupts
+       the outer caller's rbp on return. Every reg here is either
+       volatile (rcx/rdx/r8/r9, already-spilled args) or already
+       pushed by the dispatcher prologue (rbx/rsi). */
+    static const struct { uint8_t rex_b; uint8_t low3; } CTR[6] = {
+        {0, 1}, /* rcx */
+        {0, 2}, /* rdx */
+        {0, 3}, /* rbx */
+        {0, 6}, /* rsi */
+        {1, 0}, /* r8  */
+        {1, 1}, /* r9  */
+    };
+    uint8_t rnd[2], jrnd[4];
+    gen_random(rnd, 2);
+    gen_random(jrnd, 4);
+    uint32_t cidx = rnd[0] % 6;
+    int      rev  = rnd[1] & 1;
+    uint8_t  crex = CTR[cidx].rex_b;
+    uint8_t  clow = CTR[cidx].low3;
+    uint8_t *p    = out;
+
+    /* Reverse setup: rax = base + size - 1 (point to last byte). */
+    if(rev) {
+        *p++ = 0x4C; *p++ = 0x01; *p++ = 0xF0;   /* add rax, r14 */
+        *p++ = 0x48; *p++ = 0xFF; *p++ = 0xC8;   /* dec rax      */
+    }
+
+    /* mov <counter>d, r14d */
+    *p++ = 0x44 | crex;
+    *p++ = 0x89;
+    *p++ = 0xC0 | (6 << 3) | clow;
+
+    #define XJUNK(i) do { \
+        if(jrnd[i] & 1) { \
+            uint32_t _len = 1 + ((jrnd[i] >> 1) & 0x03); /* 1..4 */ \
+            p += emit_rnd_nop(p, _len); \
+        } \
+    } while(0)
+
+    XJUNK(0);
+    uint8_t *loop_top = p;
+
+    /* xor byte [rax], r15b */
+    *p++ = 0x44; *p++ = 0x30; *p++ = 0x38;
+
+    XJUNK(1);
+
+    /* inc/dec rax (64-bit forms only — 32-bit inc eax would zero the
+       upper 32 bits of the pointer and break it) */
+    *p++ = 0x48; *p++ = 0xFF; *p++ = rev ? 0xC8 : 0xC0;
+
+    XJUNK(2);
+
+    /* dec <counter> */
+    if(crex) *p++ = 0x41;
+    *p++ = 0xFF;
+    *p++ = 0xC8 | clow;
+
+    XJUNK(3);
+
+    /* jnz rel8 back to loop_top */
+    *p++ = 0x75;
+    int32_t disp = (int32_t)(loop_top - (p + 1));
+    *p++ = (uint8_t)(int8_t)disp;
+
+    #undef XJUNK
+    return (uint32_t)(p - out);
+}
+
 /* Emit the dispatcher into `out`. Returns bytes written.
  *   self_off  — dispatcher's own blob offset (relative to combined blob start,
  *               which is where LEA rip+disp arithmetic will land)
@@ -1328,15 +1432,9 @@ static uint32_t emit_dispatcher(uint8_t *out,
     /* r13 is 32-bit clean (upper zeroed by earlier mov r13d). Adding a full
        64-bit reg is fine — high 32 bits are 0. */
     *p++ = 0x48; *p++ = 0x89; *p++ = 0xC7;          /* mov rdi, rax (save decrypt base) */
-    *p++ = 0x44; *p++ = 0x89; *p++ = 0xF1;          /* mov ecx, r14d (counter) */
 
-    /* loop1: xor [rax], r15b; inc rax; dec ecx; jnz loop1 */
-    uint32_t loop1_start = D_OFF();
-    *p++ = 0x44; *p++ = 0x30; *p++ = 0x38;          /* xor [rax], r15b */
-    *p++ = 0x48; *p++ = 0xFF; *p++ = 0xC0;          /* inc rax */
-    *p++ = 0xFF; *p++ = 0xC9;                       /* dec ecx */
-    *p++ = 0x75;
-    *p++ = (uint8_t)(int8_t)((int32_t)loop1_start - (int32_t)(D_OFF() + 1));
+    /* XOR-decrypt: randomized counter reg, direction, and body junk. */
+    p += emit_xor_loop(p);
 
     /* --- Restore args and call callee at loader_base + r10 --- */
     *p++ = 0x48; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20; /* mov rcx, [rsp+0x20] */
@@ -1354,14 +1452,9 @@ static uint32_t emit_dispatcher(uint8_t *out,
 
     /* --- XOR-re-encrypt callee region using saved base (rdi) --- */
     *p++ = 0x48; *p++ = 0x89; *p++ = 0xF8;          /* mov rax, rdi */
-    *p++ = 0x44; *p++ = 0x89; *p++ = 0xF1;          /* mov ecx, r14d */
 
-    uint32_t loop2_start = D_OFF();
-    *p++ = 0x44; *p++ = 0x30; *p++ = 0x38;          /* xor [rax], r15b */
-    *p++ = 0x48; *p++ = 0xFF; *p++ = 0xC0;          /* inc rax */
-    *p++ = 0xFF; *p++ = 0xC9;                       /* dec ecx */
-    *p++ = 0x75;
-    *p++ = (uint8_t)(int8_t)((int32_t)loop2_start - (int32_t)(D_OFF() + 1));
+    /* Independent roll of counter reg + direction + junk from loop1. */
+    p += emit_xor_loop(p);
 
     /* Restore rax (callee's return value) */
     *p++ = 0x48; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x40; /* mov rax, [rsp+0x40] */
@@ -1386,8 +1479,8 @@ static uint32_t emit_dispatcher(uint8_t *out,
 }
 
 /* Rough upper bound for the emitted dispatcher (used to reserve buffer
-   space). Actual size is closer to 180. */
-#define DISPATCHER_MAX_SIZE 256u
+   space). Actual size is ~186-240 with XOR-loop shape variation. */
+#define DISPATCHER_MAX_SIZE 384u
 
 /**
  * Function: build_loader
