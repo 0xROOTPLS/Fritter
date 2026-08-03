@@ -1471,55 +1471,29 @@ static int build_loader(PFRITTER_CONFIG c) {
         break;
     }
 
-    // --- Feature 2A: Junk fall-through prefix (0-47 bytes, no jump) ---
+    // --- Feature 2A: Junk fall-through prefix (0-63 bytes, no jump) ---
     //
-    // Per output, fill 0-47 bytes from a pool of safe no-op instructions.
-    // The bytes execute as no-ops and fall through to the CALL - there is
-    // no "jump-over-junk" anchor (no leading EB/E9/etc.) for YARA rules
-    // to position from. Length AND internal layout vary per output: at any
-    // given total length, the choice of which instruction occupies which
-    // byte position differs, since pool entries are 1..9 bytes wide.
+    // Per output, fill 0-63 bytes of NOP instructions with random content
+    // in the disp fields. The bytes execute as no-ops and fall through to
+    // the CALL - there is no "jump-over-junk" anchor (no leading EB/E9/etc.)
+    // for YARA rules to position from.
     //
-    // Pool members are documented no-op forms. The CPU's NOP family
-    // (0F 1F /0 etc.) accepts a ModR/M byte that looks like memory
-    // addressing but is recognized as a NOP and performs no memory
-    // access - safe even when RAX is uninitialized at entry.
-    static const struct { uint8_t b[9]; uint8_t n; } pfx_pool[] = {
-        {{0x90},                                                  1}, // nop
-        {{0xF8},                                                  1}, // clc
-        {{0xF9},                                                  1}, // stc
-        {{0xF5},                                                  1}, // cmc
-        {{0x66, 0x90},                                            2}, // 66 nop
-        {{0x0F, 0x1F, 0x00},                                      3}, // nop dword [rax]
-        {{0x0F, 0x1F, 0xC0},                                      3}, // nop eax (reg form)
-        {{0x48, 0x87, 0xC0},                                      3}, // xchg rax, rax
-        {{0x0F, 0x1F, 0x40, 0x00},                                4}, // nop dword [rax+0]
-        {{0x0F, 0x1F, 0x44, 0x00, 0x00},                          5}, // nop dword [rax+rax+0]
-        {{0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00},                    6}, // nop word [rax+rax+0]
-        {{0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00},              7}, // nop dword [rax+0]
-        {{0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},        8}, // nop dword [rax+rax+0]
-        {{0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},  9}, // nop word [rax+rax+0]
-    };
-    #define PFX_POOL_COUNT (sizeof(pfx_pool)/sizeof(pfx_pool[0]))
-
+    // Uses emit_rnd_nop, which emits the 0F 1F /r multi-byte NOP family
+    // with random disp bytes. On P6+ the CPU decodes NOP r/m for length
+    // only and never dereferences the effective address, so the ModR/M/
+    // SIB/disp bytes are free entropy — safe even when RAX is uninitialized
+    // at entry. Chunk length also varies per iteration, so both the layout
+    // and the bytes within each NOP differ across outputs.
     static uint8_t pfx_buf[64];
     uint32_t pfx_len = 0;
     gen_random(&rnd_byte, 1);
     uint32_t pfx_target = rnd_byte & 0x3F;   // 0..63
     while(pfx_len < pfx_target) {
+      uint32_t remaining = pfx_target - pfx_len;
+      uint32_t cap = remaining < 9 ? remaining : 9;
       gen_random(&rnd_byte, 1);
-      uint32_t idx = rnd_byte % PFX_POOL_COUNT;
-      uint32_t need = pfx_pool[idx].n;
-      if(pfx_len + need > pfx_target) {
-        // would overshoot - fall back to a 1-byte entry (indices 0-3)
-        // (don't name a local "small" - Windows rpcndr.h typedefs it to char)
-        gen_random(&rnd_byte, 1);
-        uint32_t small_idx = rnd_byte & 0x03;
-        pfx_buf[pfx_len++] = pfx_pool[small_idx].b[0];
-        continue;
-      }
-      memcpy(pfx_buf + pfx_len, pfx_pool[idx].b, need);
-      pfx_len += need;
+      uint32_t chunk = 1 + (rnd_byte % cap);   // 1..cap
+      pfx_len += emit_rnd_nop(pfx_buf + pfx_len, chunk);
     }
     DPRINT("Prefix fall-through length: %u (target %u)", pfx_len, pfx_target);
 
