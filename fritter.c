@@ -1218,38 +1218,44 @@ static uint32_t emit_thunk(uint8_t *out,
  *   r14 = size in bytes (upper 32 bits zero — comes from `mov r14d,...`)
  *   r15 = byte key (in r15b)
  *
- * Per emission we randomize independently:
- *   - counter register from the 6-way clobber-safe pool
- *     {rcx, rdx, rbx, rsi, r8, r9}. rbp is deliberately excluded — the
- *     dispatcher's NONVOL_REGS push list doesn't save it, so using it
- *     as counter would corrupt the outer caller's rbp on return.
- *     rax/rdi/r10-r15 are all live during the loop, so they're out too.
- *   - direction: forward (inc rax) or reverse (dec rax, pre-loaded to
- *     base+size-1). XOR is self-inverse per byte so direction is
- *     independent per call — decrypt-forward + reencrypt-reverse (any
- *     combination) leaves data intact.
- *   - 0..4 bytes of NOP junk via emit_rnd_nop at 4 gap sites inside
- *     the body, 50% skip per gap. NOPs from 0F 1F /r don't touch flags
- *     so they are safe between `dec counter` and `jnz`.
+ * Per emission we randomize three axes independently:
+ *
+ *   1. Helper register from the 6-way clobber-safe pool
+ *      {rcx, rdx, rbx, rsi, r8, r9}. rbp is excluded — the dispatcher's
+ *      NONVOL_REGS push list doesn't save it, so using it would corrupt
+ *      the outer caller's rbp on return. rax/rdi/r10-r15 are all live
+ *      during the loop.
+ *
+ *   2. Direction: forward (inc rax) or reverse (dec rax, rax pre-loaded
+ *      to base+size-1). XOR is self-inverse per byte so direction is
+ *      independent per call — any combo of decrypt/reencrypt directions
+ *      still round-trips the region.
+ *
+ *   3. Shape: how the loop terminates. Both use the same body opcode
+ *      for the terminator + jnz opcode 0x75, so the "shape signature"
+ *      differs in the middle 3 bytes:
+ *        - counter-shape: setup `mov helper_d, r14d`; each iter
+ *          `dec helper ; jnz`. Helper counts down from size to 0.
+ *        - addr-shape:    setup `lea helper, [rax +/- ...]` capturing
+ *          end/limit ptr; each iter `cmp rax, helper ; jne`. Loop ends
+ *          when rax equals the pre-computed limit.
+ *
+ *   4. 0..4 bytes of NOP junk via emit_rnd_nop at 4 gap sites inside
+ *      the body, 50% skip per gap. 0F 1F /r NOPs don't touch flags so
+ *      they are safe between the terminator's flag-setting op and jnz.
  *
  * Post-loop:
- *   rax, counter reg, and flags all clobbered — caller must restore
+ *   rax, helper reg, and flags all clobbered — caller must restore
  *   rax if needed (dispatcher reloads from rdi for loop2).
  *
- * Body size: mov counter (3) + xor (3) + inc/dec rax (3) + dec counter
+ * Body size: setup (3..10) + xor (3) + inc/dec rax (3) + terminator
  * (2..3) + jnz rel8 (2) + up to 16 bytes junk + optional 6 bytes
- * reverse setup = up to ~36 bytes per loop.
+ * reverse rax setup = up to ~40 bytes per loop.
  */
 static uint32_t emit_xor_loop(uint8_t *out) {
-    /* rex_b = REX.B extension needed for r8-r15; low3 = 3-bit rm/reg
-       field. mov source is always r14d (rex_r=1), so REX = 0x44 | rex_b
-       and mov ModR/M = 0xC0 | (6<<3) | low3. dec is FF opcode with
-       ModR/M = 0xC8 | low3, prefixed by 0x41 iff rex_b.
-       Excludes rbp (5): it's a nonvolatile that the dispatcher's
-       NONVOL_REGS push list DOES NOT save, so clobbering it corrupts
-       the outer caller's rbp on return. Every reg here is either
-       volatile (rcx/rdx/r8/r9, already-spilled args) or already
-       pushed by the dispatcher prologue (rbx/rsi). */
+    /* rex_b = REX.B (r/m extension) or REX.R (reg extension) — same
+       bit numeric value in the REX byte; low3 = 3-bit register field.
+       Excludes rbp (5) — not in NONVOL_REGS push list. */
     static const struct { uint8_t rex_b; uint8_t low3; } CTR[6] = {
         {0, 1}, /* rcx */
         {0, 2}, /* rdx */
@@ -1258,25 +1264,52 @@ static uint32_t emit_xor_loop(uint8_t *out) {
         {1, 0}, /* r8  */
         {1, 1}, /* r9  */
     };
-    uint8_t rnd[2], jrnd[4];
-    gen_random(rnd, 2);
+    uint8_t rnd[3], jrnd[4];
+    gen_random(rnd, 3);
     gen_random(jrnd, 4);
-    uint32_t cidx = rnd[0] % 6;
-    int      rev  = rnd[1] & 1;
+    uint32_t cidx       = rnd[0] % 6;
+    int      rev        = rnd[1] & 1;
+    int      addr_shape = rnd[2] & 1;
     uint8_t  crex = CTR[cidx].rex_b;
     uint8_t  clow = CTR[cidx].low3;
     uint8_t *p    = out;
 
-    /* Reverse setup: rax = base + size - 1 (point to last byte). */
+    /* Setup order matters for addr-shape + reverse: the LEA needs rax
+       still at base to capture the correct limit (base - 1), so it
+       goes BEFORE the rax reverse setup. */
+    if(addr_shape && rev) {
+        /* lea helper, [rax - 1]  (limit = base - 1)
+           REX: W=1, R=crex; opcode 8D; ModR/M mod=01 reg=clow rm=000; disp8=0xFF */
+        *p++ = 0x48 | (crex << 2);
+        *p++ = 0x8D;
+        *p++ = 0x40 | (clow << 3);
+        *p++ = 0xFF;
+    }
+
+    /* Reverse rax setup: rax = base + size - 1 (point to last byte). */
     if(rev) {
         *p++ = 0x4C; *p++ = 0x01; *p++ = 0xF0;   /* add rax, r14 */
         *p++ = 0x48; *p++ = 0xFF; *p++ = 0xC8;   /* dec rax      */
     }
 
-    /* mov <counter>d, r14d */
-    *p++ = 0x44 | crex;
-    *p++ = 0x89;
-    *p++ = 0xC0 | (6 << 3) | clow;
+    if(addr_shape && !rev) {
+        /* lea helper, [rax + r14*1]  (limit = base + size)
+           REX: W=1, R=crex, X=1 (for r14 index); opcode 8D;
+           ModR/M mod=00 reg=clow rm=100 (SIB); SIB scale=00 idx=110 base=000 */
+        *p++ = 0x48 | (crex << 2) | 0x02;
+        *p++ = 0x8D;
+        *p++ = 0x04 | (clow << 3);
+        *p++ = 0x30;
+    }
+
+    if(!addr_shape) {
+        /* counter-shape setup: mov helper_d, r14d
+           REX: W=0, R=1 (r14 src), B=crex (helper dst); opcode 89;
+           ModR/M mod=11 reg=6 (r14 low3) rm=clow */
+        *p++ = 0x44 | crex;
+        *p++ = 0x89;
+        *p++ = 0xC0 | (6 << 3) | clow;
+    }
 
     #define XJUNK(i) do { \
         if(jrnd[i] & 1) { \
@@ -1299,14 +1332,22 @@ static uint32_t emit_xor_loop(uint8_t *out) {
 
     XJUNK(2);
 
-    /* dec <counter> */
-    if(crex) *p++ = 0x41;
-    *p++ = 0xFF;
-    *p++ = 0xC8 | clow;
+    if(addr_shape) {
+        /* cmp rax, helper
+           REX: W=1, R=crex; opcode 39; ModR/M mod=11 reg=clow rm=0 (rax) */
+        *p++ = 0x48 | (crex << 2);
+        *p++ = 0x39;
+        *p++ = 0xC0 | (clow << 3);
+    } else {
+        /* dec helper */
+        if(crex) *p++ = 0x41;
+        *p++ = 0xFF;
+        *p++ = 0xC8 | clow;
+    }
 
     XJUNK(3);
 
-    /* jnz rel8 back to loop_top */
+    /* jne/jnz rel8 back to loop_top (same opcode 0x75 for both) */
     *p++ = 0x75;
     int32_t disp = (int32_t)(loop_top - (p + 1));
     *p++ = (uint8_t)(int8_t)disp;
