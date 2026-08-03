@@ -1124,12 +1124,27 @@ static uint32_t emit_thunk(uint8_t *out,
                            int32_t  dispatcher_rel)
 {
     uint8_t *p = out;
-    /* mov r10d, target_blob_off (41 BA imm32) */
-    *p++ = 0x41; *p++ = 0xBA;
-    memcpy(p, &target_blob_off, 4); p += 4;
-    /* mov r11d, callee_id (41 BB imm32) */
-    *p++ = 0x41; *p++ = 0xBB;
-    memcpy(p, &callee_id, 4); p += 4;
+    /* Randomize which mov comes first per callsite. Dispatcher reads
+       r10 and r11 as independent inputs, so ordering is free. Kills
+       the fixed 12-byte "41 BA .. .. .. .. 41 BB .. .. .. .." prefix
+       that would otherwise repeat verbatim across every thunk. */
+    uint8_t order;
+    gen_random(&order, 1);
+    if(order & 1) {
+        /* mov r11d, callee_id (41 BB imm32) */
+        *p++ = 0x41; *p++ = 0xBB;
+        memcpy(p, &callee_id, 4); p += 4;
+        /* mov r10d, target_blob_off (41 BA imm32) */
+        *p++ = 0x41; *p++ = 0xBA;
+        memcpy(p, &target_blob_off, 4); p += 4;
+    } else {
+        /* mov r10d, target_blob_off (41 BA imm32) */
+        *p++ = 0x41; *p++ = 0xBA;
+        memcpy(p, &target_blob_off, 4); p += 4;
+        /* mov r11d, callee_id (41 BB imm32) */
+        *p++ = 0x41; *p++ = 0xBB;
+        memcpy(p, &callee_id, 4); p += 4;
+    }
     /* jmp rel32 (E9 disp32) */
     *p++ = 0xE9;
     memcpy(p, &dispatcher_rel, 4); p += 4;
