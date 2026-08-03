@@ -1217,6 +1217,30 @@ static uint32_t emit_dispatcher(uint8_t *out,
             save_order[j] = t;
         }
     }
+    /* Junk pool for prologue/epilogue gaps. Pure NOP variants only —
+       no flag mutation, no memory reference. Safe between any two
+       consecutive PUSH or POP instructions. RIP-rel disps computed by
+       RIP_DISP32 self-correct: they use D_OFF() at emission time so
+       earlier junk only shrinks the emitted displacement. */
+    static const struct { uint8_t b[4]; uint8_t n; } disp_junk[] = {
+        {{0x90},                   1}, /* nop                 */
+        {{0x66, 0x90},             2}, /* 66 nop              */
+        {{0x0F, 0x1F, 0xC0},       3}, /* nop eax (reg-form)  */
+        {{0x48, 0x87, 0xC0},       3}, /* xchg rax, rax       */
+    };
+    #define DISP_JUNK_COUNT 4
+    /* 50% chance of no junk at a given gap, else 1..3 bytes from pool.
+       Averages ~1 byte per gap → ~12 bytes total across 12 gaps. */
+    #define EMIT_JUNK() do { \
+        uint8_t _r; gen_random(&_r, 1); \
+        if(_r & 1) { \
+            uint32_t _i = (_r >> 1) & 0x03; \
+            if(_i >= DISP_JUNK_COUNT) _i = 0; \
+            memcpy(p, disp_junk[_i].b, disp_junk[_i].n); \
+            p += disp_junk[_i].n; \
+        } \
+    } while(0)
+
     for(int i = 0; i < 7; i++) {
         uint8_t r = save_order[i];
         if(r < 8) {
@@ -1224,6 +1248,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
         } else {
             *p++ = 0x41; *p++ = 0x50 + (r - 8); /* push r  (high-8)  */
         }
+        if(i < 6) EMIT_JUNK();  /* gap between consecutive pushes */
     }
 
     *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x60;  /* sub rsp, 0x60 */
@@ -1305,8 +1330,11 @@ static uint32_t emit_dispatcher(uint8_t *out,
         } else {
             *p++ = 0x41; *p++ = 0x58 + (r - 8); /* pop r   (high-8)  */
         }
+        if(i > 0) EMIT_JUNK();  /* gap between consecutive pops */
     }
     *p++ = 0xC3;                                     /* ret     */
+    #undef EMIT_JUNK
+    #undef DISP_JUNK_COUNT
 
     #undef D_OFF
     #undef RIP_DISP32
