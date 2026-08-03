@@ -1106,6 +1106,61 @@ static int save_loader(PFRITTER_CONFIG c) {
  * All opcodes below hand-verified against Intel SDM Vol 2.
  */
 
+/* Emit an x86-64 NOP of exactly `len` bytes (0..15) with random content
+   in the disp fields. Uses the 0F 1F /r multi-byte NOP family; on P6+
+   the CPU decodes NOP r/m for length only and never dereferences the
+   effective address, so the ModR/M/SIB/disp bytes are free entropy. For
+   len 10..15 the core is 9 bytes preceded by 66-prefix stacking (the
+   documented long-NOP form emitted by MSVC/GCC). Returns bytes written. */
+static uint32_t emit_rnd_nop(uint8_t *out, uint32_t len) {
+    if(len == 0) return 0;
+    if(len > 15) len = 15;
+    uint8_t rnd[8];
+    gen_random(rnd, 8);
+    uint8_t *p = out;
+    uint32_t core = len;
+    while(core > 9) { *p++ = 0x66; core--; }
+    switch(core) {
+        case 1:
+            *p++ = 0x90;
+            break;
+        case 2:
+            *p++ = 0x66; *p++ = 0x90;
+            break;
+        case 3:
+            /* Randomize between mem-form [rax] (ModR/M=00) and reg-form
+               eax (ModR/M=C0); both decode as NOP. */
+            *p++ = 0x0F; *p++ = 0x1F;
+            *p++ = (rnd[0] & 1) ? 0xC0 : 0x00;
+            break;
+        case 4:
+            *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x40;
+            *p++ = rnd[0];
+            break;
+        case 5:
+            *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x44; *p++ = 0x00;
+            *p++ = rnd[0];
+            break;
+        case 6:
+            *p++ = 0x66; *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x44; *p++ = 0x00;
+            *p++ = rnd[0];
+            break;
+        case 7:
+            *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x80;
+            memcpy(p, rnd, 4); p += 4;
+            break;
+        case 8:
+            *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x84; *p++ = 0x00;
+            memcpy(p, rnd, 4); p += 4;
+            break;
+        case 9:
+            *p++ = 0x66; *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x84; *p++ = 0x00;
+            memcpy(p, rnd, 4); p += 4;
+            break;
+    }
+    return (uint32_t)(p - out);
+}
+
 #define THUNK_SIZE 17u  /* mov r10d,imm32; mov r11d,imm32; jmp rel32 = 6+6+5 */
 
 /* Emit one thunk into `out`. Returns bytes written (== THUNK_SIZE).
@@ -1217,27 +1272,17 @@ static uint32_t emit_dispatcher(uint8_t *out,
             save_order[j] = t;
         }
     }
-    /* Junk pool for prologue/epilogue gaps. Pure NOP variants only —
-       no flag mutation, no memory reference. Safe between any two
-       consecutive PUSH or POP instructions. RIP-rel disps computed by
-       RIP_DISP32 self-correct: they use D_OFF() at emission time so
-       earlier junk only shrinks the emitted displacement. */
-    static const struct { uint8_t b[4]; uint8_t n; } disp_junk[] = {
-        {{0x90},                   1}, /* nop                 */
-        {{0x66, 0x90},             2}, /* 66 nop              */
-        {{0x0F, 0x1F, 0xC0},       3}, /* nop eax (reg-form)  */
-        {{0x48, 0x87, 0xC0},       3}, /* xchg rax, rax       */
-    };
-    #define DISP_JUNK_COUNT 4
-    /* 50% chance of no junk at a given gap, else 1..3 bytes from pool.
-       Averages ~1 byte per gap → ~12 bytes total across 12 gaps. */
+    /* 50% chance of no junk at a given gap, else 1..4 bytes emitted via
+       emit_rnd_nop (0F 1F /r NOP family with random disp bytes). Safe
+       between any two consecutive PUSH or POP instructions — the CPU
+       decodes NOP r/m for length only, never touches memory. RIP-rel
+       disps computed by RIP_DISP32 self-correct: they use D_OFF() at
+       emission time so earlier junk only shrinks the emitted disp. */
     #define EMIT_JUNK() do { \
         uint8_t _r; gen_random(&_r, 1); \
         if(_r & 1) { \
-            uint32_t _i = (_r >> 1) & 0x03; \
-            if(_i >= DISP_JUNK_COUNT) _i = 0; \
-            memcpy(p, disp_junk[_i].b, disp_junk[_i].n); \
-            p += disp_junk[_i].n; \
+            uint32_t _len = 1 + ((_r >> 1) & 0x03); /* 1..4 bytes */ \
+            p += emit_rnd_nop(p, _len); \
         } \
     } while(0)
 
@@ -1334,7 +1379,6 @@ static uint32_t emit_dispatcher(uint8_t *out,
     }
     *p++ = 0xC3;                                     /* ret     */
     #undef EMIT_JUNK
-    #undef DISP_JUNK_COUNT
 
     #undef D_OFF
     #undef RIP_DISP32
