@@ -1444,9 +1444,17 @@ static uint32_t emit_dispatcher(uint8_t *out,
     *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x60;  /* sub rsp, 0x60 */
 
     /* --- Spill arg regs into frame --- */
+    /* EMIT_JUNK() between spills breaks the 20-byte block of 4
+       identical-shape `mov [rsp+X], reg` instructions. NOPs from
+       0F 1F /r don't touch flags, don't reference memory, and are
+       safe between any mov/mov, mov/lea, add/mov, or mov/call pair
+       in this middle section. */
     *p++ = 0x48; *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20; /* mov [rsp+0x20], rcx */
+    EMIT_JUNK();
     *p++ = 0x48; *p++ = 0x89; *p++ = 0x54; *p++ = 0x24; *p++ = 0x28; /* mov [rsp+0x28], rdx */
+    EMIT_JUNK();
     *p++ = 0x4C; *p++ = 0x89; *p++ = 0x44; *p++ = 0x24; *p++ = 0x30; /* mov [rsp+0x30], r8  */
+    EMIT_JUNK();
     *p++ = 0x4C; *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x38; /* mov [rsp+0x38], r9  */
 
     /* --- Locate fn_table entry: rsi = &fn_table_area[16 + id*12] --- */
@@ -1454,21 +1462,29 @@ static uint32_t emit_dispatcher(uint8_t *out,
     RIP_DISP32(ft_off);
     *p++ = 0x48; *p++ = 0x83; *p++ = 0xC6; *p++ = 0x10;  /* add rsi, 16 (skip marker+count+pad) */
 
+    EMIT_JUNK();
     *p++ = 0x45; *p++ = 0x89; *p++ = id_modrm;      /* mov r12d, <id_reg>d (callee_id → r12) */
+    EMIT_JUNK();
     *p++ = 0x4D; *p++ = 0x6B; *p++ = 0xE4; *p++ = 0x0C;  /* imul r12, r12, 12 (entry size) */
+    EMIT_JUNK();
     *p++ = 0x49; *p++ = 0x01; *p++ = 0xF4;          /* add r12, rsi (r12 = &entries[id]) */
 
     /* --- Load fn_entry fields into nonvolatile regs --- */
+    EMIT_JUNK();
     *p++ = 0x45; *p++ = 0x8B; *p++ = 0x2C; *p++ = 0x24;              /* mov r13d, [r12]    (offset) */
+    EMIT_JUNK();
     *p++ = 0x45; *p++ = 0x8B; *p++ = 0x74; *p++ = 0x24; *p++ = 0x04; /* mov r14d, [r12+4]  (size)   */
+    EMIT_JUNK();
     *p++ = 0x45; *p++ = 0x0F; *p++ = 0xB6; *p++ = 0x7C; *p++ = 0x24; *p++ = 0x08; /* movzx r15d, byte [r12+8] (key) */
 
     /* --- Compute loader_base into r12 (reuse — done with fn_entry ptr) --- */
+    EMIT_JUNK();
     *p++ = 0x48; *p++ = 0x8D; *p++ = 0x05;          /* lea rax, [rip+lb_disp] */
     RIP_DISP32(loader_off);
     *p++ = 0x49; *p++ = 0x89; *p++ = 0xC4;          /* mov r12, rax (loader_base) */
 
     /* --- XOR-decrypt callee region: rdi = base = loader_base + fn_entry.offset --- */
+    EMIT_JUNK();
     *p++ = 0x4C; *p++ = 0x01; *p++ = 0xE8;          /* add rax, r13 (loader_base + offset) */
     /* r13 is 32-bit clean (upper zeroed by earlier mov r13d). Adding a full
        64-bit reg is fine — high 32 bits are 0. */
@@ -1479,13 +1495,19 @@ static uint32_t emit_dispatcher(uint8_t *out,
 
     /* --- Restore args and call callee at loader_base + r10 --- */
     *p++ = 0x48; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20; /* mov rcx, [rsp+0x20] */
+    EMIT_JUNK();
     *p++ = 0x48; *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24; *p++ = 0x28; /* mov rdx, [rsp+0x28] */
+    EMIT_JUNK();
     *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x30; /* mov r8,  [rsp+0x30] */
+    EMIT_JUNK();
     *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x38; /* mov r9,  [rsp+0x38] */
 
     /* Compute callee entry: rax = loader_base + r10 (target_blob_off) */
+    EMIT_JUNK();
     *p++ = 0x4C; *p++ = 0x89; *p++ = 0xE0;          /* mov rax, r12 (loader_base) */
+    EMIT_JUNK();
     *p++ = 0x4C; *p++ = 0x01; *p++ = target_modrm;  /* add rax, <target_reg> (+ target offset) */
+    EMIT_JUNK();
     *p++ = 0xFF; *p++ = 0xD0;                       /* call rax */
 
     /* Save return value */
