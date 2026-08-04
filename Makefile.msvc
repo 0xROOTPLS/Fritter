@@ -68,7 +68,7 @@ encrypt:
 	cl -Zp8 -nologo -DTEST -I include encrypt.c
 
 # Test harness. Built into test\ where tools\seed_sweep.py expects it.
-# Not part of `fritter` or `clean` — these are committed fixtures, so a plain
+# Not part of `fritter` or `clean`, these are committed fixtures, so a plain
 # build never dirties them; run this target only to rebuild them deliberately.
 harness:
 	@echo ###### Building test harness ######

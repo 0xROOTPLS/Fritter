@@ -1,5 +1,5 @@
 # Compiled binaries produced by `make`.
-# Leading slash anchors to repo root — a bare `exe2h` would also match the
+# Leading slash anchors to repo root, a bare `exe2h` would also match the
 # loader/exe2h/ SOURCE directory, since patterns without a slash match at any depth.
 /fritter
 /fritter.exe
@@ -39,10 +39,10 @@ include/poly_seed.h
 include/api_shuffle.h
 
 # Generated shellcode / blob outputs (smoke tests, packer output, linux loader).
-# test/calc.exe and test/inject_local64.exe are deliberate test fixtures — see README.
+# test/calc.exe and test/inject_local64.exe are deliberate test fixtures, see README.
 *.bin
 
-# DLL build target (Makefile.msvc `dll`) — lib/fritter.h is source, the rest are outputs
+# DLL build target (Makefile.msvc `dll`), lib/fritter.h is source, the rest are outputs
 lib/fritter.dll
 lib/fritter.exp
 
@@ -63,7 +63,7 @@ dist/
 docs/design/prototype/*.exe
 docs/design/prototype/*.obj
 
-# Internal audit reports — kept on disk, deliberately never entered into git
+# Internal audit reports, kept on disk, deliberately never entered into git
 # history so the decision to publish them stays open.
 Review/
 

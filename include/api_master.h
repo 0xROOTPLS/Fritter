@@ -7,7 +7,7 @@
  *   type  = function-pointer typedef from loader/winapi.h
  *   field = field name in FRITTER_INSTANCE.api typed struct
  *
- * Slot 0 (LoadLibraryA) MUST stay first — loader.c resolves it
+ * Slot 0 (LoadLibraryA) MUST stay first, loader.c resolves it
  * explicitly before the DLL-loading loop. Everything else can be
  * shuffled per build by tools/gen_api_shuffle, which preserves the
  * pin and randomizes order 1..N.

@@ -1,13 +1,13 @@
-/* dispatch_v2.c — expanded function-granular dispatch prototype
+/* dispatch_v2.c, expanded function-granular dispatch prototype
  *
  * Follow-up to dispatch_proto.c. Adds the mechanics that v1 skipped
  * so phase 3 (real-loader integration) has fewer unknowns:
  *
  *   1. Five protected functions, not two
  *   2. Deeper call chain (A -> B -> C) and branching (A -> D)
- *   3. Resident partition — some functions never get encrypted
+ *   3. Resident partition, some functions never get encrypted
  *      (models Memcpy/Memset/Memcmp and the dispatcher itself)
- *   4. Wrapper pattern — resident entry_wrapper() calls dispatch
+ *   4. Wrapper pattern, resident entry_wrapper() calls dispatch
  *      to invoke a protected fn_A. Demonstrates the fix for the
  *      MainProc-as-CreateThread-callback problem (loader.c:77):
  *      hand Windows the resident wrapper, not the encrypted target.
@@ -37,11 +37,11 @@
 /* Function IDs. Layout order must match source order below because
  * setup computes sizes as (next_fn - this_fn). */
 enum {
-    FN_ID_A = 0,   /* protected — calls B and D */
-    FN_ID_B,       /* protected — calls C */
-    FN_ID_C,       /* protected — leaf */
-    FN_ID_D,       /* RESIDENT — hot leaf, no dispatch overhead */
-    FN_ID_E,       /* protected — leaf, called only from wrapper direct test */
+    FN_ID_A = 0,   /* protected, calls B and D */
+    FN_ID_B,       /* protected, calls C */
+    FN_ID_C,       /* protected, leaf */
+    FN_ID_D,       /* RESIDENT, hot leaf, no dispatch overhead */
+    FN_ID_E,       /* protected, leaf, called only from wrapper direct test */
     FN_ID_MAX,
     FN_ID_NONE = 0xFFFFu
 };
@@ -92,7 +92,7 @@ static NOINLINE uint64_t proto_fn_C(uint64_t x, uint64_t y, uint64_t z, uint64_t
 }
 
 /* fn_D: RESIDENT hot leaf. Returns x + 100. Called via dispatch but
- * dispatch short-circuits — no encrypt/decrypt for resident targets. */
+ * dispatch short-circuits, no encrypt/decrypt for resident targets. */
 static NOINLINE uint64_t proto_fn_D(uint64_t x, uint64_t y, uint64_t z, uint64_t w) {
     (void)y; (void)z; (void)w;
     return x + 100;
@@ -258,7 +258,7 @@ static int test_deep_and_branching(void) {
      *         = (15+1) + 105
      *         = 121                                                */
     printf("\n--- Test 1: deep+branching call chain via entry_wrapper ---\n");
-    printf("  entry_wrapper_A(5) — models CreateThread(entry_wrapper_A, 5)\n\n");
+    printf("  entry_wrapper_A(5), models CreateThread(entry_wrapper_A, 5)\n\n");
     uint64_t result = entry_wrapper_A(5);
     int ok = (result == 121)
           && (count_protected_plaintext() == 0)

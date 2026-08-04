@@ -34,7 +34,7 @@
 #include "loader_peb1_exe_x64.h"
 #include "loader_peb2_exe_x64.h"
 #include "dispatch_shim_exe_x64.h"
-/* Function-granular dispatch companion tables — emitted by exe2h alongside
+/* Function-granular dispatch companion tables, emitted by exe2h alongside
    the blob headers above. Consumed only under N>1 dispatch mode. */
 #include "loader_peb1_fn_table_x64.h"
 #include "loader_peb1_ref_table_x64.h"
@@ -1164,10 +1164,10 @@ static uint32_t emit_rnd_nop(uint8_t *out, uint32_t len) {
 #define THUNK_SIZE 17u  /* mov r10d,imm32; mov r11d,imm32; jmp rel32 = 6+6+5 */
 
 /* Emit one thunk into `out`. Returns bytes written (== THUNK_SIZE).
- *   target_blob_off — where within the loader blob the callee's
+ *   target_blob_off, where within the loader blob the callee's
  *                     specific entry point lives (loader-base-relative).
- *   callee_id       — index into the runtime fn_table.
- *   dispatcher_rel  — signed rel32 from end-of-jmp to dispatcher entry.
+ *   callee_id      , index into the runtime fn_table.
+ *   dispatcher_rel , signed rel32 from end-of-jmp to dispatcher entry.
  *                     Positive if dispatcher precedes... actually
  *                     dispatcher is BEFORE thunks in blob order
  *                     ([loader][dispatcher][thunks]) so this is
@@ -1219,7 +1219,7 @@ static uint32_t emit_thunk(uint8_t *out,
    All uses of ModR/M rm=100 need SIB (encodes "index+base" instead of
    "base"); r12 as a memory base triggers this (r12 has low3=4, which
    collides with rsp's encoding). r13 as memory base with mod=00 would
-   be interpreted as RIP-relative — so we always emit disp8=0 form to
+   be interpreted as RIP-relative, so we always emit disp8=0 form to
    keep encoding uniform across roles. Costs one byte per load vs the
    variable "shortest form", worth the simplicity. */
 
@@ -1267,7 +1267,7 @@ static uint32_t emit_movzx_r32_mem8(uint8_t *out, uint8_t dst, uint8_t base, int
  *
  * Caller pre-loads:
  *   rax       = base address of region
- *   size_reg  = size in bytes (upper 32 bits zero — comes from `mov r32,...`)
+ *   size_reg  = size in bytes (upper 32 bits zero, comes from `mov r32,...`)
  *   key_reg   = byte key (in low 8 bits)
  *
  * size_reg and key_reg are register indices in the 12..15 range (r12..r15).
@@ -1278,14 +1278,14 @@ static uint32_t emit_movzx_r32_mem8(uint8_t *out, uint8_t dst, uint8_t base, int
  * Per emission we randomize three axes independently:
  *
  *   1. Helper register from the 6-way clobber-safe pool
- *      {rcx, rdx, rbx, rsi, r8, r9}. rbp is excluded — the dispatcher's
+ *      {rcx, rdx, rbx, rsi, r8, r9}. rbp is excluded, the dispatcher's
  *      NONVOL_REGS push list doesn't save it, so using it would corrupt
  *      the outer caller's rbp on return. rax/rdi/r10-r15 are all live
  *      during the loop.
  *
  *   2. Direction: forward (inc rax) or reverse (dec rax, rax pre-loaded
  *      to base+size-1). XOR is self-inverse per byte so direction is
- *      independent per call — any combo of decrypt/reencrypt directions
+ *      independent per call, any combo of decrypt/reencrypt directions
  *      still round-trips the region.
  *
  *   3. Shape: how the loop terminates. Both use the same jnz opcode
@@ -1302,13 +1302,13 @@ static uint32_t emit_movzx_r32_mem8(uint8_t *out, uint8_t dst, uint8_t base, int
  *      they are safe between the terminator's flag-setting op and jnz.
  *
  * Post-loop:
- *   rax, helper reg, and flags all clobbered — caller must restore
+ *   rax, helper reg, and flags all clobbered, caller must restore
  *   rax if needed (dispatcher reloads from rdi for loop2).
  */
 static uint32_t emit_xor_loop(uint8_t *out, uint8_t size_reg, uint8_t key_reg) {
-    /* rex_b = REX.B (r/m extension) or REX.R (reg extension) — same
+    /* rex_b = REX.B (r/m extension) or REX.R (reg extension), same
        bit numeric value in the REX byte; low3 = 3-bit register field.
-       Excludes rbp (5) — not in NONVOL_REGS push list. */
+       Excludes rbp (5), not in NONVOL_REGS push list. */
     static const struct { uint8_t rex_b; uint8_t low3; } CTR[6] = {
         {0, 1}, /* rcx */
         {0, 2}, /* rdx */
@@ -1393,7 +1393,7 @@ static uint32_t emit_xor_loop(uint8_t *out, uint8_t size_reg, uint8_t key_reg) {
 
     XJUNK(1);
 
-    /* inc/dec rax (64-bit forms only — 32-bit inc eax would zero the
+    /* inc/dec rax (64-bit forms only, 32-bit inc eax would zero the
        upper 32 bits of the pointer and break it) */
     *p++ = 0x48; *p++ = 0xFF; *p++ = rev ? 0xC8 : 0xC0;
 
@@ -1424,10 +1424,10 @@ static uint32_t emit_xor_loop(uint8_t *out, uint8_t size_reg, uint8_t key_reg) {
 }
 
 /* Emit the dispatcher into `out`. Returns bytes written.
- *   self_off  — dispatcher's own blob offset (relative to combined blob start,
+ *   self_off , dispatcher's own blob offset (relative to combined blob start,
  *               which is where LEA rip+disp arithmetic will land)
- *   loader_off  — loader region's blob offset (= shim_padded_size)
- *   ft_off      — fn_table_area's blob offset (marker-relative, inside shim)
+ *   loader_off , loader region's blob offset (= shim_padded_size)
+ *   ft_off     , fn_table_area's blob offset (marker-relative, inside shim)
  *
  * ABI on entry (from thunk tail-jmp):
  *   r10 = target_blob_off (loader-blob-relative callee entry point)
@@ -1469,10 +1469,10 @@ static uint32_t emit_dispatcher(uint8_t *out,
        {r12, r13, r14, r15} per build. Every ModR/M byte referencing
        these regs varies per build (24 permutations = ~4.6 bits of
        entropy on top of everything else). Roles:
-         PTR: fn_entry ptr, later loader_base — 64-bit
-         OFF: fn_entry.offset — u32 (upper 32 zeroed by mov r32)
-         SZ:  fn_entry.size   — u32
-         KEY: fn_entry.key    — byte in low 8
+         PTR: fn_entry ptr, later loader_base, 64-bit
+         OFF: fn_entry.offset, u32 (upper 32 zeroed by mov r32)
+         SZ:  fn_entry.size  , u32
+         KEY: fn_entry.key   , byte in low 8
        emit_xor_loop is passed SZ and KEY so the XOR-loop opcodes vary
        with the rotation as well. */
     static const uint8_t STATE_REGS[4] = {12, 13, 14, 15};
@@ -1516,7 +1516,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
     }
     /* 50% chance of no junk at a given gap, else 1..4 bytes emitted via
        emit_rnd_nop (0F 1F /r NOP family with random disp bytes). Safe
-       between any two consecutive PUSH or POP instructions — the CPU
+       between any two consecutive PUSH or POP instructions, the CPU
        decodes NOP r/m for length only, never touches memory. RIP-rel
        disps computed by RIP_DISP32 self-correct: they use D_OFF() at
        emission time so earlier junk only shrinks the emitted disp. */
@@ -1587,7 +1587,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
     EMIT_JUNK();
     p += emit_movzx_r32_mem8(p, KEY, PTR, 8);   /* movzx KEY_d, byte [PTR+8] (key)  */
 
-    /* --- Compute loader_base into PTR (reuse — done with fn_entry ptr) --- */
+    /* --- Compute loader_base into PTR (reuse, done with fn_entry ptr) --- */
     EMIT_JUNK();
     *p++ = 0x48; *p++ = 0x8D; *p++ = 0x05;          /* lea rax, [rip+lb_disp] */
     RIP_DISP32(loader_off);
@@ -1607,7 +1607,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
     *p++ = 0x01;
     *p++ = 0xC0 | (OFF_low3 << 3);
     /* OFF is 32-bit clean (upper zeroed by earlier mov r32). Adding a full
-       64-bit reg is fine — high 32 bits are 0. */
+       64-bit reg is fine, high 32 bits are 0. */
     *p++ = 0x48; *p++ = 0x89; *p++ = 0xC7;          /* mov rdi, rax (save decrypt base) */
 
     /* XOR-decrypt: randomized helper, direction, shape, and body junk.
@@ -1769,7 +1769,7 @@ static int build_loader(PFRITTER_CONFIG c) {
     // Uses emit_rnd_nop, which emits the 0F 1F /r multi-byte NOP family
     // with random disp bytes. On P6+ the CPU decodes NOP r/m for length
     // only and never dereferences the effective address, so the ModR/M/
-    // SIB/disp bytes are free entropy — safe even when RAX is uninitialized
+    // SIB/disp bytes are free entropy, safe even when RAX is uninitialized
     // at entry. Chunk length also varies per iteration, so both the layout
     // and the bytes within each NOP differ across outputs.
     static uint8_t pfx_buf[64];
@@ -2276,12 +2276,12 @@ static int build_loader(PFRITTER_CONFIG c) {
     uint32_t disp_slot  = 0;
     uint32_t thunks_size = 0;
     uint32_t pre_disp_pad = 0;  /* random 0..63 bytes before dispatcher */
-    int      input_swap  = 0;   /* r10/r11 semantic role — thunk+dispatcher agree */
+    int      input_swap  = 0;   /* r10/r11 semantic role, thunk+dispatcher agree */
     if(use_ngt1) {
       /* Residency policy: only .text (FritterLoader + MainProcEntry +
          untagged helpers) stays resident because the shim jmps to its
          entry directly and Windows calls MainProcEntry via CreateThread.
-         .main_pr is now protected — MainProcEntry's cross-section call
+         .main_pr is now protected, MainProcEntry's cross-section call
          to MainProc gets thunkified by the rewriter. */
       for(uint32_t i = 0; i < L_FN_COUNT; i++) {
         if(strncmp(L_FNS[i].name, ".text", 5) == 0) {

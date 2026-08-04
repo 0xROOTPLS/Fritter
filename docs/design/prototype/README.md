@@ -1,4 +1,4 @@
-# Function-Granular Dispatch — Prototype
+# Function-Granular Dispatch, Prototype
 
 Standalone proof-of-concept for the design in
 [`../function_granular_dispatch.md`](../function_granular_dispatch.md).
@@ -9,12 +9,12 @@ real loader.
 
 Two "protected" functions live in the harness's `.text`:
 
-- `proto_fn_A(x)` — calls `proto_fn_B(x+1)` via `dispatch()`
-- `proto_fn_B(x)` — returns `x * 2` (leaf, no dispatch calls)
+- `proto_fn_A(x)`, calls `proto_fn_B(x+1)` via `dispatch()`
+- `proto_fn_B(x)`, returns `x * 2` (leaf, no dispatch calls)
 
 At startup: the pages containing both functions are marked RWX, then
 each function's bytes are XOR-encrypted in place. From that point on
-neither is directly callable — every invocation goes through
+neither is directly callable, every invocation goes through
 `dispatch(caller_id, callee_id, arg)`, which performs:
 
 1. **Encrypt caller** in place
@@ -24,7 +24,7 @@ neither is directly callable — every invocation goes through
 
 Between calls only one function is plaintext at a time. The harness
 tracks the maximum concurrent-plaintext count across the whole run
-and reports it — the invariant `max == 1` is what the prototype
+and reports it, the invariant `max == 1` is what the prototype
 proves.
 
 No VEH is registered. No `VirtualProtect` is called during dispatch
@@ -80,21 +80,21 @@ sizes differ (gcc emits tighter code than MSVC's `/Od`).
 | MSVC 14.44 (/Od)        | 48 | 32 | PASS |
 | gcc mingw-w64 (-O0)     | 41 | 14 | PASS |
 
-## v2 — expanded prototype (2026-07-30)
+## v2, expanded prototype (2026-07-30)
 
 `dispatch_v2.c` extends v1 with the mechanics phase 3 needs before
 touching the real loader:
 
 - **Five functions**, not two, with a mixed protected/resident partition
-- **Deeper chain** — `fn_A → fn_B → fn_C` exercises three-level dispatch
-- **Branching** — `fn_A` also calls resident `fn_D` in the same body
-- **Resident short-circuit** — `fn_D` is marked resident; dispatch to
+- **Deeper chain**, `fn_A → fn_B → fn_C` exercises three-level dispatch
+- **Branching**, `fn_A` also calls resident `fn_D` in the same body
+- **Resident short-circuit**, `fn_D` is marked resident; dispatch to
   it skips all crypt ops and calls directly
-- **Wrapper pattern** — `entry_wrapper_A` is a resident stub that
+- **Wrapper pattern**, `entry_wrapper_A` is a resident stub that
   enters dispatch to invoke protected `fn_A`. This is the fix for
-  `loader.c:77` handing `MainProc` to `CreateThread` — the wrapper
+  `loader.c:77` handing `MainProc` to `CreateThread`, the wrapper
   is what Windows gets, `MainProc` itself stays encrypted
-- **Invariant check across all cases** — max concurrent protected
+- **Invariant check across all cases**, max concurrent protected
   plaintext must stay ≤ 1 through arbitrary call chains
 
 Build (both toolchains):
@@ -127,8 +127,8 @@ Two remaining pieces still need proving before real integration:
   thunks instead of the callee's new offset. A ~30-line change to
   `pack_extract`, but not yet prototyped.
 
-Everything else the real loader needs — multi-function correctness,
-deep chains, resident partition, callback-safe wrapper — is proven
+Everything else the real loader needs, multi-function correctness,
+deep chains, resident partition, callback-safe wrapper, is proven
 by v2 across both toolchains.
 
 ## What this does NOT demonstrate
@@ -142,7 +142,7 @@ scope:
   rewriter or an equivalent.
 - **Concurrency** across the three loader threads (shim, host,
   MainProc). Prototype is single-threaded.
-- **Recursion.** Same reason — the two functions don't call
+- **Recursion.** Same reason, the two functions don't call
   themselves.
 - **Indirect calls that bypass thunks** (TLS callbacks, thread starts,
   CRT continuations for the embedded PE). None here.
@@ -154,7 +154,7 @@ scope:
   functions; the design-doc numbers (`<1μs` per crypt event, ~40,000×
   win on maru→Memset) are estimates awaiting confirmation.
 
-Any of those can invalidate the mechanics — the prototype's PASS says
+Any of those can invalidate the mechanics, the prototype's PASS says
 only that the four-op cycle itself is sound and that the exposure
 invariant holds under it. Phase 2 (real-loader integration) has to
 solve the rest.

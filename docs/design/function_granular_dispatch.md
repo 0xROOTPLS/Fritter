@@ -1,7 +1,7 @@
-# Function-Granular Dispatch — Design Proposal
+# Function-Granular Dispatch, Design Proposal
 
 **Status:** v1 (whole-loader, N=1) SHIPPED 2026-07-30. Per-function
-(N>1) is the follow-up — see "Phase-3 v1 landing" below.
+(N>1) is the follow-up, see "Phase-3 v1 landing" below.
 **Date:** 2026-07-29 (original), 2026-07-30 (v1 shipped)
 **Supersedes:** the VEH sliding window in `loader/veh_shim.c`
 (retained in-tree, no longer built by the pipeline).
@@ -26,7 +26,7 @@
 - MSVC: 5/5 pop, avg 0.47s
 - gcc:  5/5 pop, avg 0.39s
 - Prior VEH-era MSVC/gcc gap (~11x) is closed. Both toolchains now
-  hit the same ~0.4s wall — the actual cost of the loader running.
+  hit the same ~0.4s wall, the actual cost of the loader running.
 
 ## Motivation
 
@@ -44,7 +44,7 @@ Three costs scale together because they share one underlying event:
 
 2. **A registered vectored handler.** `RtlAddVectoredExceptionHandler`
    links into ntdll's `LdrpVectorHandlerList`. Anything walking that
-   list sees a handler pointing into a private RWX region — a static
+   list sees a handler pointing into a private RWX region, a static
    fingerprint at zero frequency.
 
 3. **Traffic pattern.** Thousands of first-chance access violations
@@ -61,7 +61,7 @@ design change can retire both.
 Cross-function calls route through a dispatcher. Each call edge
 performs four crypt operations:
 
-1. Encrypt the caller (in place, RWX region — no syscall)
+1. Encrypt the caller (in place, RWX region, no syscall)
 2. Decrypt the callee
 3. Callee runs
 4. On return: encrypt callee, decrypt caller
@@ -70,7 +70,7 @@ performs four crypt operations:
 loader is ciphertext.
 
 No exceptions raised. No handler registered. Memory protection is set
-once at load (RWX) and never changes. XOR remains the crypto layer —
+once at load (RWX) and never changes. XOR remains the crypto layer,
 same as the sliding window; speed matters more than crypto strength
 per the existing design target (per-output byte uniqueness, not
 cryptographic resistance).
@@ -101,7 +101,7 @@ Not every function should be protected. The rule:
 
 > Encrypt what's identifiable. Leave resident what's generic.
 
-A byte-copy loop looks like every other byte-copy loop — no signature
+A byte-copy loop looks like every other byte-copy loop, no signature
 value. Encrypting it costs speed (crypt on every call) and gains
 nothing. So `Memcpy` / `Memset` / `Memcmp` stay resident.
 
@@ -166,16 +166,16 @@ Three of the open questions below now have concrete answers:
 
 - **`pack.h` reusability:** confirmed. `pack_ref_t` already records
   every cross-section E8/E9/RIP-rel with source+target+disp_offset.
-  The rewrite loop at `pack.h:562-572` needs one surgical change —
+  The rewrite loop at `pack.h:562-572` needs one surgical change,
   point disps at per-callee thunk offsets instead of the callee's
   new offset. Not new infrastructure.
 
 - **Indirect callbacks:** the only loader-side callback that matters
   is `CreateThread(MainProc)` at `loader.c:77`. Solution: a resident
-  wrapper stub — Windows gets the wrapper's address, wrapper enters
+  wrapper stub, Windows gets the wrapper's address, wrapper enters
   dispatch to invoke encrypted MainProc. Prototype v2 demonstrates.
   Windows APIs used by the embedded PE (TLS callbacks, thread starts)
-  target the embedded PE itself, not the loader — no constraint on
+  target the embedded PE itself, not the loader, no constraint on
   us.
 
 Still open: dispatch metadata format (fixed table vs inlined at call
@@ -190,9 +190,9 @@ Each needs an answer before implementation.
 
 Every call edge needs the callee address, key, and size. Options:
 
-- **Fixed table** — simple, but its size and layout are a signature
+- **Fixed table**, simple, but its size and layout are a signature
   anchor.
-- **Inlined at call site** — each call gets the metadata as immediate
+- **Inlined at call site**, each call gets the metadata as immediate
   operands, patched by fritter at generation. Metadata disappears into
   the code stream.
 
@@ -204,7 +204,7 @@ close read of `pack.h` before committing to this path.
 ### Concurrency
 
 The current architecture has multiple threads live in the loader
-region simultaneously (shim, host, MainProc — see the Site B writeup).
+region simultaneously (shim, host, MainProc, see the Site B writeup).
 If Thread A has function X decrypted and Thread B tries to call
 function Y that's also currently decrypted, ordering matters. Three
 plausible answers:
@@ -234,7 +234,7 @@ behalf.
 ### pack.h reusability
 
 Design assumes `pack.h`'s displacement rewriter can retarget
-inter-function calls to a dispatcher. Confirm before committing — if
+inter-function calls to a dispatcher. Confirm before committing, if
 it can't, generator-side rewrite is a bigger lift.
 
 ### The current single-.text merge (orthogonal but relevant)
@@ -262,7 +262,7 @@ If adopted, this retires:
 
 - Per-output / per-build polymorphism approach and the generator tools
   (`gen_poly`, `gen_api_shuffle`)
-- `LOADER_FN_SECTION` tagging — same tags mark what's protected
+- `LOADER_FN_SECTION` tagging, same tags mark what's protected
 - Build pipeline: exe2h extraction, orchestrator-side blob building,
   format emitter
 - `TheWover/Odzhan`'s PE→shellcode foundation (untouched under this
@@ -276,7 +276,7 @@ Not implementation. The right next step is:
 2. Enumerate all indirect-call sites (function pointers handed out to
    the OS) and decide their residency
 3. Decide the concurrency model
-4. Prototype in a branch — git is available now, experiments are safe
+4. Prototype in a branch, git is available now, experiments are safe
 
 Estimated size: a several-week rework, not a weekend project. Broad
 but shallow: touches loader, shim, exe2h, and `fritter.c`, but mostly

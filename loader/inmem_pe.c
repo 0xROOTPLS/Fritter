@@ -607,7 +607,7 @@ pe_cleanup:
       if (origmod != NULL)
         inst->api.VirtualFree(origmod, ntc.OptionalHeader.SizeOfHeaders, MEM_RELEASE | MEM_DECOMMIT);
 
-      // skip unmap in thread mode — CRT callbacks point into mapped section
+      // skip unmap in thread mode, CRT callbacks point into mapped section
       if(mod->thread == 0) {
         inst->api.NtUnmapViewOfSection(inst->api.GetCurrentProcess(), cs);
         inst->api.CloseHandle(hSection);

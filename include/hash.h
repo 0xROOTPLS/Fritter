@@ -51,7 +51,7 @@ void *Memset (void *ptr, int value, unsigned int num);
 #define MARU_IV_LEN    MARU_HASH_LEN
 #define MARU_CRYPT     hash_cipher
 
-// ARX hash cipher parameters — change these to alter the signature
+// ARX hash cipher parameters, change these to alter the signature
 #ifndef HASH_ROT_A
 #define HASH_ROT_A  7
 #endif

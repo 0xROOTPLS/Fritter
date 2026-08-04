@@ -1,4 +1,4 @@
-# The tree is LF throughout. Pin it so Windows checkouts don't rewrite to CRLF —
+# The tree is LF throughout. Pin it so Windows checkouts don't rewrite to CRLF,
 # _smoke.sh and the Makefiles run under WSL, where CRLF breaks them outright.
 * text=auto eol=lf
 

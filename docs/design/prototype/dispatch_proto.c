@@ -1,4 +1,4 @@
-/* dispatch_proto.c — function-granular dispatch prototype
+/* dispatch_proto.c, function-granular dispatch prototype
  *
  * See docs/design/function_granular_dispatch.md for the full design.
  * This file demonstrates the four-crypt-op cycle in isolation:
@@ -52,7 +52,7 @@ typedef struct {
 
 static fn_meta_t g_fns[FN_ID_MAX];
 
-/* dispatch lives in the harness's regular .text — never crypted. */
+/* dispatch lives in the harness's regular .text, never crypted. */
 static NOINLINE uint32_t dispatch(uint16_t caller_id, uint16_t callee_id, uint32_t arg);
 
 /* -------- Protected functions --------
@@ -121,14 +121,14 @@ static NOINLINE uint32_t dispatch(uint16_t caller_id, uint16_t callee_id, uint32
 
     report_exposure("entry");
 
-    /* Step 1 — encrypt caller. */
+    /* Step 1, encrypt caller. */
     if (caller_id != FN_ID_NONE) {
         xor_region(g_fns[caller_id].base, g_fns[caller_id].size,
                    g_fns[caller_id].key);
         report_exposure("after encrypt-caller");
     }
 
-    /* Step 2 — decrypt callee. */
+    /* Step 2, decrypt callee. */
     xor_region(g_fns[callee_id].base, g_fns[callee_id].size,
                g_fns[callee_id].key);
     report_exposure("after decrypt-callee");
@@ -139,12 +139,12 @@ static NOINLINE uint32_t dispatch(uint16_t caller_id, uint16_t callee_id, uint32
         if (n > g_max_concurrent_plain) g_max_concurrent_plain = n;
     }
 
-    /* Step 3 — call the callee. */
+    /* Step 3, call the callee. */
     fn_t callee_fn = (fn_t)g_fns[callee_id].base;
     result = callee_fn(arg);
     report_exposure("after callee returns");
 
-    /* Step 4 — encrypt callee, decrypt caller. */
+    /* Step 4, encrypt callee, decrypt caller. */
     xor_region(g_fns[callee_id].base, g_fns[callee_id].size,
                g_fns[callee_id].key);
     if (caller_id != FN_ID_NONE) {

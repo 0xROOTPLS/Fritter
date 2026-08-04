@@ -52,7 +52,7 @@
 #define ROTL32(v,n)(((v)<<(n))|((v)>>(32-(n))))
 #endif
 
-// Custom ARX block cipher — 128-bit block, 128-bit key
+// Custom ARX block cipher, 128-bit block, 128-bit key
 // Change these to alter the cipher signature
 #define ENCRYPT block_cipher
 
@@ -60,7 +60,7 @@
 #define CIPHER_ROUNDS 20
 #endif
 
-// Rotation schedule for the permutation — 6 values per round
+// Rotation schedule for the permutation, 6 values per round
 #ifndef CIPHER_R0
 #define CIPHER_R0 5
 #endif

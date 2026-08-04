@@ -1,4 +1,4 @@
-# Fritter — Linux build (static-musl ELF)
+# Fritter, Linux build (static-musl ELF)
 #
 # Produces a self-contained x86_64 Linux orchestrator that runs on any
 # modern distro without runtime libc dependencies. The loader payload is
@@ -72,7 +72,7 @@ release: fritter
 	@ls -lh dist/fritter-linux-x64
 	@cat dist/fritter-linux-x64.sha256
 
-# Test harness — Windows PE test hosts, cross-built via mingw. Output goes to
+# Test harness, Windows PE test hosts, cross-built via mingw. Output goes to
 # test/ where tools/seed_sweep.py expects it. Not wired into `fritter` or
 # `clean`: these are committed fixtures, so rebuild them only on purpose.
 harness:

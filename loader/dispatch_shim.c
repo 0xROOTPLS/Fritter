@@ -83,7 +83,7 @@
 /* IN_DISP pins the dispatcher into its own PE code section so exe2h's
    multi-section path picks it up. Fritter then reads DISPATCH_SHIM_FNS[1]
    from the shim's companion fn_table header to learn the dispatcher's
-   offset within the shim blob — no marker scan needed.
+   offset within the shim blob, no marker scan needed.
    MSVC: .disp$a is a fresh code section (read+execute). gcc: named
    attribute section, source-order-preserved by -fno-toplevel-reorder. */
 #ifdef _MSC_VER
@@ -130,9 +130,9 @@ typedef void* (*LoaderEntry_fn)(void*);
 #define MAX_FN_COUNT        16
 
 /* FN_ENTRY - one per protected function. 12 bytes exactly.
-   flags bit 0: RESIDENT — never encrypted at rest, no crypt work
+   flags bit 0: RESIDENT, never encrypted at rest, no crypt work
                 by shim OR dispatcher (dispatcher fast-path calls directly).
-   flags bit 1: SHIM_DECRYPT — encrypted at rest, shim decrypts once at
+   flags bit 1: SHIM_DECRYPT, encrypted at rest, shim decrypts once at
                 entry (v1 whole-loader model). Not dispatcher-managed.
                 Under N>1 per-function dispatch, protected sections have
                 NEITHER flag: encrypted at rest, dispatcher decrypts on
@@ -163,7 +163,7 @@ static int    shim_strcmp(const char *a, const char *b);
 static void   shim_xor_region(uint8_t *base, uint32_t size, uint8_t key);
 static void   shim_wipe_region(uint8_t *base, uint32_t size, uint8_t byte);
 
-/* DispatcherEntry — placeholder in .disp so the section exists and
+/* DispatcherEntry, placeholder in .disp so the section exists and
  * exe2h reports its offset in DISPATCH_SHIM_FNS[1].
  *
  * The real dispatcher body is NOT reserved here. Fritter appends the
@@ -250,7 +250,7 @@ void DispatchShimEntry(void *inst, void *shim_base) {
 
     /* Decrypt each SHIM_DECRYPT entry in place. Under v1 whole-loader
        dispatch, one entry covers the entire loader with FN_FLAG_SHIM_DECRYPT
-       set. Under N>1 per-function dispatch, no entries have this flag —
+       set. Under N>1 per-function dispatch, no entries have this flag,
        the dispatcher (living at the loader-blob tail) owns the crypt
        cycle for every protected section on a per-call basis. */
     for (uint32_t i = 0; i < fn_count; i++) {
@@ -426,7 +426,7 @@ static int shim_strcmp(const char *a, const char *b) {
     return (*a != *b) ? 1 : 0;
 }
 
-/* memset stub — the shim links with -nodefaultlib. MSVC emits a call
+/* memset stub, the shim links with -nodefaultlib. MSVC emits a call
    to memset for the zero-fill tail of the partially-initialized
    g_fn_table_area below; without this stub the link fails. Placed
    at the tail (with g_fn_table_area) so under gcc's -fno-toplevel-
@@ -440,7 +440,7 @@ void *memset(void *dst, int c, size_t n) {
     return dst;
 }
 
-/* Fn table definition — placed at the tail of the source file so
+/* Fn table definition, placed at the tail of the source file so
    under both compilers it lands AFTER DispatchShimEntry in .text.
    MSVC: /Gy COMDAT + .veh$z merged into .text keeps entry at .text+0.
    gcc: -fno-toplevel-reorder honors source order → entry first.

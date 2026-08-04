@@ -575,7 +575,7 @@ int main (int argc, char *argv[]) {
                 bin2go(map, argv[1], blob, blob_size);
                 /* Emit companion tables. Single-section path (packer skipped)
                    still gets a valid fn_table with one entry at offset 0 and
-                   an empty ref_table — fritter's build_loader can then treat
+                   an empty ref_table, fritter's build_loader can then treat
                    both paths uniformly. */
                 if(code_count == 1) {
                   psecs[0].new_offset = 0;
