@@ -56,6 +56,10 @@
 
 #include "pack.h"
 
+/* Set by any step that could not produce its output. main() returns it,
+   so make/nmake stop instead of building fritter from stale headers. */
+static int g_failed = 0;
+
 // return pointer to DOS header
 PIMAGE_DOS_HEADER DosHdr(void *map) {
     return (PIMAGE_DOS_HEADER)map;
@@ -188,7 +192,7 @@ void bin2h(void *map, char *fname, void *bin, uint32_t len) {
       fprintf(fd, "};\n\n");
       fclose(fd);
       printf("  [ saved code to %s\n", file);
-    } else printf("  [ unable to create file : %s\n", file);
+    } else { printf("  [ unable to create file : %s\n", file); g_failed = 1; }
 }
 
 void bin2go(void* map, char* fname, void* bin, uint32_t len) {
@@ -234,7 +238,7 @@ void bin2go(void* map, char* fname, void* bin, uint32_t len) {
 		fclose(fd);
 		printf("  [ saved code to %s\n", file);
 	}
-	else printf("  [ unable to create file : %s\n", file);
+	else { printf("  [ unable to create file : %s\n", file); g_failed = 1; }
 }
 
 
@@ -276,6 +280,7 @@ static void emit_fn_table_h(void *map, const char *fname,
     fd = fopen(out_file, "wb");
     if(fd == NULL) {
         printf("  [ unable to create file : %s\n", out_file);
+        g_failed = 1;
         return;
     }
 
@@ -328,6 +333,7 @@ static void emit_ref_table_h(void *map, const char *fname,
     fd = fopen(out_file, "wb");
     if(fd == NULL) {
         printf("  [ unable to create file : %s\n", out_file);
+        g_failed = 1;
         return;
     }
 
@@ -444,7 +450,7 @@ int main (int argc, char *argv[]) {
     
     if (argc != 2) {
       printf ("\n  [ usage: file2h <file.exe | file.bin>\n");
-      return 0;
+      return 1;
     }
 
     printf("  [ Opening file for reading: %s\n", argv[1]);
@@ -454,7 +460,7 @@ int main (int argc, char *argv[]) {
     
     if(fp == NULL) {
       printf("  [ Unable to open %s\n", argv[1]);
-      return 0;
+      return 1;
     } else {
       printf("  [ File opened.\n");
     }
@@ -468,7 +474,10 @@ int main (int argc, char *argv[]) {
       // map into memory
       map = (uint8_t*)mmap(NULL, fs.st_size,
         PROT_READ, MAP_PRIVATE, fileno(fp), 0);
-      if(map != NULL) {
+      if(map == NULL || map == (uint8_t*)MAP_FAILED) {
+        printf("  [ unable to map %s\n", argv[1]);
+        g_failed = 1;
+      } else {
         if(valid_dos_hdr(map) && valid_nt_hdr(map)) {
           printf("  [ Found valid DOS and NT header.\n");
           sh = SecHdr(map);
@@ -482,13 +491,26 @@ int main (int argc, char *argv[]) {
                with random bytes (not 0x90) so the post-XOR ciphertext
                doesn't expose a repeating-pattern signature.
 
-               Single-section builds (mingw/gcc) and the LDE-fallback
+               Single-section builds and the LDE-fallback
                path use the original RVA-preserving extraction. */
             pack_sec_t psecs[PACK_MAX_SECTIONS];
             int code_count = 0;
             int default_text_idx = -1;
 
             printf("  [ Scanning for code sections (IMAGE_SCN_CNT_CODE).\n");
+            {
+              int total_code = 0;
+              for(i=0; i<SecSize(map); i++) {
+                if(sh[i].Characteristics & IMAGE_SCN_CNT_CODE) total_code++;
+              }
+              if(total_code > PACK_MAX_SECTIONS) {
+                printf("  [ FATAL: %d code sections, limit is %d (PACK_MAX_SECTIONS).\n",
+                    total_code, PACK_MAX_SECTIONS);
+                munmap(map, fs.st_size);
+                fclose(fp);
+                return 1;
+              }
+            }
             for(i=0; i<SecSize(map) && code_count < PACK_MAX_SECTIONS; i++) {
               if(sh[i].Characteristics & IMAGE_SCN_CNT_CODE) {
                 pack_sec_t *ps = &psecs[code_count];
@@ -521,6 +543,7 @@ int main (int argc, char *argv[]) {
 
             if(code_count == 0) {
               printf("  [ no code sections found.\n");
+              g_failed = 1;
             } else {
               uint32_t blob_size = 0;
               uint8_t  *blob = NULL;
@@ -538,17 +561,20 @@ int main (int argc, char *argv[]) {
               if(code_count > 1) {
                 blob = pack_extract(map, psecs, code_count, &blob_size,
                                     &refs, &n_refs);
+                if(blob == NULL) {
+                  /* No fallback for multi-section input: an unpacked
+                     blob has no valid fn/ref tables, and fritter would
+                     build broken shellcode from it. */
+                  printf("  [ FATAL: packer failed on %d-section input; no output written.\n",
+                      code_count);
+                  munmap(map, fs.st_size);
+                  fclose(fp);
+                  return 1;
+                }
               }
 
               if(blob == NULL) {
-                /* Single section, or packer failed: RVA-preserving
-                   extraction. Gaps between sections (if any) are
-                   filled with the same deterministic-random byte
-                   stream as the packer uses, NOT with 0x90 - long
-                   NOP runs are a YARA-able fingerprint and the
-                   per-page XOR encryption converts a NOP run into
-                   a repeating-8-byte-ciphertext signature that's
-                   even more distinctive. */
+                /* Single section: RVA-preserving extraction. */
                 uint32_t base_rva = 0xFFFFFFFFu, end_rva = 0u;
                 for(i = 0; i < code_count; i++) {
                   uint32_t s_end = psecs[i].vaddr + psecs[i].vsize;
@@ -586,6 +612,7 @@ int main (int argc, char *argv[]) {
                 if(refs) free(refs);
               } else {
                 printf("  [ allocation failed for %u-byte blob.\n", blob_size);
+                g_failed = 1;
                 if(refs) free(refs);
               }
             }
@@ -602,5 +629,5 @@ int main (int argc, char *argv[]) {
       }
     }
     fclose(fp);
-    return 0;
+    return g_failed;
 }

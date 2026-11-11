@@ -34,19 +34,19 @@ static VOID ActiveScript_New(PFRITTER_INSTANCE inst, IActiveScriptSite *this) {
     MyIActiveScriptSite *mas = (MyIActiveScriptSite*)this;
     
     // Initialize IUnknown
-    mas->site.lpVtbl->QueryInterface      = ADR(LPVOID, ActiveScript_QueryInterface);
-    mas->site.lpVtbl->AddRef              = ADR(LPVOID, ActiveScript_AddRef);
-    mas->site.lpVtbl->Release             = ADR(LPVOID, ActiveScript_Release);
+    mas->site.lpVtbl->QueryInterface      = MaskIn(inst, ADR(LPVOID, ActiveScript_QueryInterface));
+    mas->site.lpVtbl->AddRef              = MaskIn(inst, ADR(LPVOID, ActiveScript_AddRef));
+    mas->site.lpVtbl->Release             = MaskIn(inst, ADR(LPVOID, ActiveScript_Release));
     
     // Initialize IActiveScriptSite
-    mas->site.lpVtbl->GetLCID             = ADR(LPVOID, ActiveScript_GetLCID);
-    mas->site.lpVtbl->GetItemInfo         = ADR(LPVOID, ActiveScript_GetItemInfo);
-    mas->site.lpVtbl->GetDocVersionString = ADR(LPVOID, ActiveScript_GetDocVersionString);
-    mas->site.lpVtbl->OnScriptTerminate   = ADR(LPVOID, ActiveScript_OnScriptTerminate);
-    mas->site.lpVtbl->OnStateChange       = ADR(LPVOID, ActiveScript_OnStateChange);
-    mas->site.lpVtbl->OnScriptError       = ADR(LPVOID, ActiveScript_OnScriptError);
-    mas->site.lpVtbl->OnEnterScript       = ADR(LPVOID, ActiveScript_OnEnterScript);
-    mas->site.lpVtbl->OnLeaveScript       = ADR(LPVOID, ActiveScript_OnLeaveScript);
+    mas->site.lpVtbl->GetLCID             = MaskIn(inst, ADR(LPVOID, ActiveScript_GetLCID));
+    mas->site.lpVtbl->GetItemInfo         = MaskIn(inst, ADR(LPVOID, ActiveScript_GetItemInfo));
+    mas->site.lpVtbl->GetDocVersionString = MaskIn(inst, ADR(LPVOID, ActiveScript_GetDocVersionString));
+    mas->site.lpVtbl->OnScriptTerminate   = MaskIn(inst, ADR(LPVOID, ActiveScript_OnScriptTerminate));
+    mas->site.lpVtbl->OnStateChange       = MaskIn(inst, ADR(LPVOID, ActiveScript_OnStateChange));
+    mas->site.lpVtbl->OnScriptError       = MaskIn(inst, ADR(LPVOID, ActiveScript_OnScriptError));
+    mas->site.lpVtbl->OnEnterScript       = MaskIn(inst, ADR(LPVOID, ActiveScript_OnEnterScript));
+    mas->site.lpVtbl->OnLeaveScript       = MaskIn(inst, ADR(LPVOID, ActiveScript_OnLeaveScript));
     
     mas->site.m_cRef                      = 0;
     mas->inst                             = inst;
@@ -237,13 +237,13 @@ static STDMETHODIMP ActiveScript_OnLeaveScript(IActiveScriptSite *this) {
 // initialize virtual function table for this interface
 static VOID ActiveScriptSiteWindow_New(PFRITTER_INSTANCE inst, IActiveScriptSiteWindow *this) {
     // Initialize IUnknown
-    this->lpVtbl->QueryInterface      = ADR(LPVOID, ActiveScriptSiteWindow_QueryInterface);
-    this->lpVtbl->AddRef              = ADR(LPVOID, ActiveScriptSiteWindow_AddRef);
-    this->lpVtbl->Release             = ADR(LPVOID, ActiveScriptSiteWindow_Release);
+    this->lpVtbl->QueryInterface      = MaskIn(inst, ADR(LPVOID, ActiveScriptSiteWindow_QueryInterface));
+    this->lpVtbl->AddRef              = MaskIn(inst, ADR(LPVOID, ActiveScriptSiteWindow_AddRef));
+    this->lpVtbl->Release             = MaskIn(inst, ADR(LPVOID, ActiveScriptSiteWindow_Release));
     
     // Initialize IActiveScriptSiteWindow
-    this->lpVtbl->GetWindow           = ADR(LPVOID, ActiveScriptSiteWindow_GetWindow);
-    this->lpVtbl->EnableModeless      = ADR(LPVOID, ActiveScriptSiteWindow_EnableModeless);
+    this->lpVtbl->GetWindow           = MaskIn(inst, ADR(LPVOID, ActiveScriptSiteWindow_GetWindow));
+    this->lpVtbl->EnableModeless      = MaskIn(inst, ADR(LPVOID, ActiveScriptSiteWindow_EnableModeless));
 
     this->m_cRef                      = 0;
     this->inst                        = inst;

@@ -133,60 +133,54 @@ int base64_template(void *pic, uint32_t pic_len, FILE *fd) {
         fwrite(base64, 1, outlen, fd);
       }
     }
-    // if on windows, copy base64 string to clipboard
-    #if defined(WINDOWS)
-      LPSTR   strCopy;
-      HGLOBAL hCopy;
-
-      DPRINT("Opening clipboard");
-      if(OpenClipboard(NULL)) {
-        DPRINT("Empying contents");
-        EmptyClipboard();
-
-        DPRINT("Allocating memory");
-        // CF_TEXT requires NUL-terminated buffer; +1 for the terminator
-        hCopy = GlobalAlloc(GMEM_MOVEABLE, outlen + 1);
-        if(hCopy != NULL) {
-          strCopy = (LPSTR)GlobalLock(hCopy);
-          if(strCopy != NULL) {
-            CopyMemory(strCopy, base64, outlen);
-            strCopy[outlen] = '\0';
-            GlobalUnlock(hCopy);
-            DPRINT("Setting clipboard data");
-            // SetClipboardData transfers ownership of hCopy on success;
-            // only free it ourselves if the call fails.
-            if(!SetClipboardData(CF_TEXT, hCopy)) {
-              GlobalFree(hCopy);
-            }
-          } else {
-            GlobalFree(hCopy);
-          }
-        }
-        CloseClipboard();
-      }
-    #endif
     DPRINT("Freeing memory");
     free(base64);
     return FRITTER_ERROR_OK;
 }
 
+// Name of the variable and bytes per line in the source formats.
+static char fmt_name[32] = "buf";
+static uint32_t fmt_w    = 16;
+
+void format_style(const char *name, int width) {
+    if(name != NULL && name[0] != 0 && strlen(name) < sizeof(fmt_name)) strcpy(fmt_name, name);
+    if(width >= 4 && width <= 64) fmt_w = (uint32_t)width;
+}
+
 int c_ruby_template(void * pic, uint32_t pic_len, FILE* fd){
     uint32_t j;
     uint8_t *p = (uint8_t*)pic;
-    
-    fprintf(fd, "unsigned char buf[] = \n");
-    
+
+    fprintf(fd, "unsigned char %s[] = \n", fmt_name);
+
     for(j=0; j < pic_len; j++) {
-      if(j % 16 == 0) fputc('\"', fd);
-      
+      if(j % fmt_w == 0) fputc('\"', fd);
+
       fprintf(fd, "\\x%02x", p[j]);
 
-      if(j % 16 == 15 && j+1 < pic_len){
+      if(j % fmt_w == fmt_w - 1 && j+1 < pic_len){
         fprintf(fd, "\"\n");
       }
     }
     fprintf(fd, "\";\n");
-    
+
+    return FRITTER_ERROR_OK;
+}
+
+// Ruby: binary string built up 16 bytes per line.
+int ruby_template(void * pic, uint32_t pic_len, FILE* fd){
+    uint32_t j;
+    uint8_t *p = (uint8_t*)pic;
+
+    fprintf(fd, "%s = \"\".b\n", fmt_name);
+
+    for(j=0; j < pic_len; j++) {
+      if(j % fmt_w == 0) fprintf(fd, "%s << \"", fmt_name);
+
+      fprintf(fd, "\\x%02x", p[j]);
+
+      if(j % fmt_w == fmt_w - 1 || j+1 == pic_len) fprintf(fd, "\".b\n");
+    }
     return FRITTER_ERROR_OK;
 }
 
@@ -194,20 +188,21 @@ int py_template(void * pic, uint32_t pic_len, FILE* fd){
     uint32_t j;
     uint8_t *p = (uint8_t*)pic;
 
-    fprintf(fd, "buf   = \"\"\n");
+    // bytes literals: a plain string is text in Python 3
+    fprintf(fd, "%s  = b\"\"\n", fmt_name);
 
     for(j=0; j < pic_len; j++){
-      if(j % 16 == 0) {
-        fprintf(fd, "buf  += \"");
+      if(j % fmt_w == 0) {
+        fprintf(fd, "%s += b\"", fmt_name);
       }
       fprintf(fd, "\\x%02x", p[j]);
 
-      if(j % 16 == 15) {
+      if(j % fmt_w == fmt_w - 1) {
         fprintf(fd, "\"\n");
       }
     }
-    if(j % 16 != 0) {
-      fputc('\"', fd);
+    if(j % fmt_w != 0) {
+      fprintf(fd, "\"\n");
     }
     return FRITTER_ERROR_OK;
 }
@@ -216,7 +211,7 @@ int powershell_template(void * pic, uint32_t pic_len, FILE* fd){
     uint32_t j;
     uint8_t *p = (uint8_t*)pic;
     
-    fprintf(fd, "[Byte[]] $buf = ");
+    fprintf(fd, "[Byte[]] $%s = ", fmt_name);
 
     for(j=0; j < pic_len; j++){
       fprintf(fd, "0x%02x", p[j]);
@@ -229,13 +224,14 @@ int csharp_template(void * pic, uint32_t pic_len, FILE* fd){
     uint32_t j;
     uint8_t *p = (uint8_t*)pic;
 
-    fprintf(fd, "byte[] my_buf = new byte[%" PRId32"] {\n", pic_len);
+    fprintf(fd, "byte[] %s = new byte[%" PRId32"] {\n", fmt_name, pic_len);
 
     for(j=0; j < pic_len; j++){
       fprintf(fd, "0x%02x", p[j]);
       if(j < pic_len-1) fputc(',', fd);
+      if(j % fmt_w == fmt_w - 1 || j == pic_len-1) fputc('\n', fd);
     }
-    fprintf(fd, "};");
+    fprintf(fd, "};\n");
     
     return FRITTER_ERROR_OK;
 }

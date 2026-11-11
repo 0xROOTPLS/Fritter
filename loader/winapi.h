@@ -45,6 +45,8 @@
       LPVOID                 lpMem);
 
     typedef HANDLE (WINAPI *GetProcessHeap_t)();
+
+    typedef HLOCAL (WINAPI *LocalFree_t)(HLOCAL hMem);
     typedef DWORD (WINAPI *GetLastError_t)();
 
     typedef LPVOID (WINAPI *HeapReAlloc_t)(
@@ -79,6 +81,10 @@
     typedef LPWSTR* (WINAPI *CommandLineToArgvW_t)(LPCWSTR lpCmdLine, int* pNumArgs);
 
     typedef BOOL (WINAPI *CloseHandle_t)(HANDLE hObject);
+
+    typedef void (WINAPI *ExitProcess_t)(UINT uExitCode);
+
+    typedef BOOL (WINAPI *TerminateProcess_t)(HANDLE hProcess, UINT uExitCode);
 
     typedef HANDLE (WINAPI *GetCurrentProcess_t)();
   
@@ -242,75 +248,6 @@
         HANDLE                hHandle,
         DWORD                 dwMilliseconds);
 
-    // imports from wininet.dll
-    typedef BOOL (WINAPI *InternetCrackUrl_t)(
-      LPCSTR                  lpszUrl,
-      DWORD                   dwUrlLength,
-      DWORD                   dwFlags,
-      LPURL_COMPONENTS        lpUrlComponents);
-
-    typedef HINTERNET (WINAPI *InternetOpen_t)(
-      LPCSTR                lpszAgent,
-      DWORD                 dwAccessType,
-      LPCSTR                lpszProxy,
-      LPCSTR                lpszProxyBypass,
-      DWORD                 dwFlags);
-
-    typedef HINTERNET (WINAPI *InternetConnect_t)(
-      HINTERNET             hInternet,
-      LPCSTR                lpszServerName,
-      INTERNET_PORT         nServerPort,
-      LPCSTR                lpszUserName,
-      LPCSTR                lpszPassword,
-      DWORD                 dwService,
-      DWORD                 dwFlags,
-      DWORD_PTR             dwContext);
-
-    typedef BOOL (WINAPI *InternetQueryDataAvailable_t)(
-      HINTERNET             hFile,
-      LPDWORD               lpdwNumberOfBytesAvailable,
-      DWORD                 dwFlags,
-      DWORD_PTR             dwContext);
-
-    typedef HINTERNET (WINAPI *HttpOpenRequest_t)(
-      HINTERNET             hConnect,
-      LPCSTR                lpszVerb,
-      LPCSTR                lpszObjectName,
-      LPCSTR                lpszVersion,
-      LPCSTR                lpszReferrer,
-      LPCSTR                *lplpszAcceptTypes,
-      DWORD                 dwFlags,
-      DWORD_PTR             dwContext);
-
-    typedef BOOL (WINAPI *InternetSetOption_t)(
-      HINTERNET             hInternet,
-      DWORD                 dwOption,
-      LPVOID                lpBuffer,
-      DWORD                 dwBufferLength);
-
-    typedef BOOL (WINAPI *HttpSendRequest_t)(
-      HINTERNET             hRequest,
-      LPCSTR                lpszHeaders,
-      DWORD                 dwHeadersLength,
-      LPVOID                lpOptional,
-      DWORD                 dwOptionalLength);
-
-    typedef BOOL (WINAPI *HttpQueryInfo_t)(
-      HINTERNET             hRequest,
-      DWORD                 dwInfoLevel,
-      LPVOID                lpBuffer,
-      LPDWORD               lpdwBufferLength,
-      LPDWORD               lpdwIndex);
-
-    typedef BOOL (WINAPI *InternetReadFile_t)(
-      HINTERNET             hFile,
-      LPVOID                lpBuffer,
-      DWORD                 dwNumberOfBytesToRead,
-      LPDWORD               lpdwNumberOfBytesRead);
-
-    typedef BOOL (WINAPI *InternetCloseHandle_t)(
-      HINTERNET             hInternet);
-
     typedef BOOL (WINAPI *CryptAcquireContext_t)(
       HCRYPTPROV            *phProv,
       LPCSTR                szContainer,
@@ -455,6 +392,11 @@
       PCWSTR                SourceString);
           
     typedef void (WINAPI *RtlExitUserThread_t)(UINT uExitCode);
+    typedef BOOL (WINAPI *GetProcessMitigationPolicy_t)(HANDLE hProcess, DWORD MitigationPolicy, PVOID lpBuffer, SIZE_T dwLength);
+    typedef PVOID (WINAPI *VirtualAlloc2_t)(HANDLE Process, PVOID BaseAddress, SIZE_T Size, ULONG AllocationType, ULONG PageProtection, PVOID ExtendedParameters, ULONG ParameterCount);
+    typedef PVOID (WINAPI *MapViewOfFile3_t)(HANDLE FileMapping, HANDLE Process, PVOID BaseAddress, ULONG64 Offset, SIZE_T ViewSize, ULONG AllocationType, ULONG PageProtection, PVOID ExtendedParameters, ULONG ParameterCount);
+    typedef VOID (NTAPI *RtlCaptureContext_t)(PCONTEXT ContextRecord);
+    typedef VOID (NTAPI *RtlRestoreContext_t)(PCONTEXT ContextRecord, PVOID ExceptionRecord);
 
     typedef void (WINAPI *RtlExitUserProcess_t)(NTSTATUS ExitStatus);
     
@@ -494,6 +436,14 @@
     typedef NTSTATUS(NTAPI *NtUnmapViewOfSection_t)(
       HANDLE ProcessHandle,
       PVOID BaseAddress);
+
+    typedef BOOLEAN (NTAPI *RtlAddFunctionTable_t)(
+      PVOID   FunctionTable,
+      DWORD   EntryCount,
+      DWORD64 BaseAddress);
+
+    typedef BOOLEAN (NTAPI *RtlDeleteFunctionTable_t)(
+      PVOID   FunctionTable);
 
     typedef enum _SECTION_INHERIT {
       ViewShare = 1,

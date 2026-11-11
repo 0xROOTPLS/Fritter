@@ -10,7 +10,11 @@ CC            := gcc
 MUSL          := musl-gcc
 MINGW         := x86_64-w64-mingw32-gcc
 
-LOADER_CFLAGS := -fno-toplevel-reorder -fno-builtin -fpack-struct=8 -fPIC -O1 -nostdlib
+# -fno-ipa-ra / -fno-reorder-blocks-and-partition: the dispatcher sits
+# between loader sections, so calls must follow the plain Win64 ABI and a
+# function must not be split across sections.
+LOADER_CFLAGS := -fno-toplevel-reorder -fno-builtin -fpack-struct=8 -fPIC -O1 -nostdlib \
+                 -fno-ipa-ra -fno-reorder-blocks-and-partition
 LOADER_SRCS   := loader/loader.c loader/depack.c loader/clib.c hash.c encrypt.c
 
 FRITTER_SRCS  := fritter.c hash.c encrypt.c format.c loader/clib.c
@@ -83,9 +87,9 @@ harness:
 clean:
 	rm -rf dist
 	rm -f exe2h gen_poly gen_api_shuffle include/poly_seed.h include/api_shuffle.h fritter loader.bin instance \
-	      loader_peb1.exe loader_peb2.exe veh_shim.exe dispatch_shim.exe \
-	      loader_peb1_exe_x64.h loader_peb2_exe_x64.h veh_shim_exe_x64.h dispatch_shim_exe_x64.h \
-	      loader_peb1_exe_x64.go loader_peb2_exe_x64.go veh_shim_exe_x64.go dispatch_shim_exe_x64.go \
+	      loader_peb1.exe loader_peb2.exe dispatch_shim.exe \
+	      loader_peb1_exe_x64.h loader_peb2_exe_x64.h dispatch_shim_exe_x64.h \
+	      loader_peb1_exe_x64.go loader_peb2_exe_x64.go dispatch_shim_exe_x64.go \
 	      loader_peb1_fn_table_x64.h loader_peb1_ref_table_x64.h \
 	      loader_peb2_fn_table_x64.h loader_peb2_ref_table_x64.h \
 	      dispatch_shim_fn_table_x64.h dispatch_shim_ref_table_x64.h

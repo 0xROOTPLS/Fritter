@@ -35,40 +35,40 @@ static HRESULT Host_New(PFRITTER_INSTANCE inst, IHost *host) {
     WCHAR   buf[FRITTER_MAX_NAME+1];
     
     // IUnknown interface
-    host->lpVtbl->QueryInterface     = ADR(LPVOID, Host_QueryInterface);
-    host->lpVtbl->AddRef             = ADR(LPVOID, Host_AddRef);
-    host->lpVtbl->Release            = ADR(LPVOID, Host_Release);
+    host->lpVtbl->QueryInterface     = MaskIn(inst, ADR(LPVOID, Host_QueryInterface));
+    host->lpVtbl->AddRef             = MaskIn(inst, ADR(LPVOID, Host_AddRef));
+    host->lpVtbl->Release            = MaskIn(inst, ADR(LPVOID, Host_Release));
     
     // IDispatch interface
-    host->lpVtbl->GetTypeInfoCount   = ADR(LPVOID, Host_GetTypeInfoCount);
-    host->lpVtbl->GetTypeInfo        = ADR(LPVOID, Host_GetTypeInfo);
-    host->lpVtbl->GetIDsOfNames      = ADR(LPVOID, Host_GetIDsOfNames);
-    host->lpVtbl->Invoke             = ADR(LPVOID, Host_Invoke);
+    host->lpVtbl->GetTypeInfoCount   = MaskIn(inst, ADR(LPVOID, Host_GetTypeInfoCount));
+    host->lpVtbl->GetTypeInfo        = MaskIn(inst, ADR(LPVOID, Host_GetTypeInfo));
+    host->lpVtbl->GetIDsOfNames      = MaskIn(inst, ADR(LPVOID, Host_GetIDsOfNames));
+    host->lpVtbl->Invoke             = MaskIn(inst, ADR(LPVOID, Host_Invoke));
     
     // IHost interface
-    host->lpVtbl->get_Name           = ADR(LPVOID, Host_get_Name);
-    host->lpVtbl->get_Application    = ADR(LPVOID, Host_get_Application);
-    host->lpVtbl->get_FullName       = ADR(LPVOID, Host_get_FullName);
-    host->lpVtbl->get_Path           = ADR(LPVOID, Host_get_Path);
-    host->lpVtbl->get_Interactive    = ADR(LPVOID, Host_get_Interactive);
-    host->lpVtbl->put_Interactive    = ADR(LPVOID, Host_put_Interactive);
-    host->lpVtbl->Quit               = ADR(LPVOID, Host_Quit);
-    host->lpVtbl->get_ScriptName     = ADR(LPVOID, Host_get_ScriptName);
-    host->lpVtbl->get_ScriptFullName = ADR(LPVOID, Host_get_ScriptFullName);
-    host->lpVtbl->get_Arguments      = ADR(LPVOID, Host_get_Arguments);
-    host->lpVtbl->get_Version        = ADR(LPVOID, Host_get_Version);
-    host->lpVtbl->get_BuildVersion   = ADR(LPVOID, Host_get_BuildVersion);
-    host->lpVtbl->get_Timeout        = ADR(LPVOID, Host_get_Timeout);
-    host->lpVtbl->put_Timeout        = ADR(LPVOID, Host_put_Timeout);
-    host->lpVtbl->CreateObject       = ADR(LPVOID, Host_CreateObject);
-    host->lpVtbl->Echo               = ADR(LPVOID, Host_Echo);
-    host->lpVtbl->GetObject          = ADR(LPVOID, Host_GetObject);
-    host->lpVtbl->DisconnectObject   = ADR(LPVOID, Host_DisconnectObject);
-    host->lpVtbl->Sleep              = ADR(LPVOID, Host_Sleep);
-    host->lpVtbl->ConnectObject      = ADR(LPVOID, Host_ConnectObject);
-    host->lpVtbl->get_StdIn          = ADR(LPVOID, Host_get_StdIn);
-    host->lpVtbl->get_StdOut         = ADR(LPVOID, Host_get_StdOut);
-    host->lpVtbl->get_StdErr         = ADR(LPVOID, Host_get_StdErr);
+    host->lpVtbl->get_Name           = MaskIn(inst, ADR(LPVOID, Host_get_Name));
+    host->lpVtbl->get_Application    = MaskIn(inst, ADR(LPVOID, Host_get_Application));
+    host->lpVtbl->get_FullName       = MaskIn(inst, ADR(LPVOID, Host_get_FullName));
+    host->lpVtbl->get_Path           = MaskIn(inst, ADR(LPVOID, Host_get_Path));
+    host->lpVtbl->get_Interactive    = MaskIn(inst, ADR(LPVOID, Host_get_Interactive));
+    host->lpVtbl->put_Interactive    = MaskIn(inst, ADR(LPVOID, Host_put_Interactive));
+    host->lpVtbl->Quit               = MaskIn(inst, ADR(LPVOID, Host_Quit));
+    host->lpVtbl->get_ScriptName     = MaskIn(inst, ADR(LPVOID, Host_get_ScriptName));
+    host->lpVtbl->get_ScriptFullName = MaskIn(inst, ADR(LPVOID, Host_get_ScriptFullName));
+    host->lpVtbl->get_Arguments      = MaskIn(inst, ADR(LPVOID, Host_get_Arguments));
+    host->lpVtbl->get_Version        = MaskIn(inst, ADR(LPVOID, Host_get_Version));
+    host->lpVtbl->get_BuildVersion   = MaskIn(inst, ADR(LPVOID, Host_get_BuildVersion));
+    host->lpVtbl->get_Timeout        = MaskIn(inst, ADR(LPVOID, Host_get_Timeout));
+    host->lpVtbl->put_Timeout        = MaskIn(inst, ADR(LPVOID, Host_put_Timeout));
+    host->lpVtbl->CreateObject       = MaskIn(inst, ADR(LPVOID, Host_CreateObject));
+    host->lpVtbl->Echo               = MaskIn(inst, ADR(LPVOID, Host_Echo));
+    host->lpVtbl->GetObject          = MaskIn(inst, ADR(LPVOID, Host_GetObject));
+    host->lpVtbl->DisconnectObject   = MaskIn(inst, ADR(LPVOID, Host_DisconnectObject));
+    host->lpVtbl->Sleep              = MaskIn(inst, ADR(LPVOID, Host_Sleep));
+    host->lpVtbl->ConnectObject      = MaskIn(inst, ADR(LPVOID, Host_ConnectObject));
+    host->lpVtbl->get_StdIn          = MaskIn(inst, ADR(LPVOID, Host_get_StdIn));
+    host->lpVtbl->get_StdOut         = MaskIn(inst, ADR(LPVOID, Host_get_StdOut));
+    host->lpVtbl->get_StdErr         = MaskIn(inst, ADR(LPVOID, Host_get_StdErr));
     
     host->m_cRef                     = 0;
     host->inst                       = inst;
@@ -305,7 +305,8 @@ static HRESULT WINAPI Host_Sleep(
   IHost *iface, LONG Time) {
     
     DPRINT("WScript::Sleep");
-    iface->inst->api.Sleep((DWORD)Time);
+    // masked for as long as the script sleeps
+    ((VOID (WINAPI *)(DWORD))MaskCall(iface->inst, (PVOID)iface->inst->api.Sleep))((DWORD)Time);
     
     return S_OK;
 }

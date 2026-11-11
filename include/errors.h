@@ -40,8 +40,8 @@
 #define FRITTER_ERROR_NET_PARAMS           5
 #define FRITTER_ERROR_NO_MEMORY            6
 #define FRITTER_ERROR_INVALID_ARCH         7
-#define FRITTER_ERROR_INVALID_URL          8
-#define FRITTER_ERROR_URL_LENGTH           9
+#define FRITTER_ERROR_RESERVED_8           8  // was INVALID_URL (HTTP staging removed)
+#define FRITTER_ERROR_RESERVED_9           9  // was URL_LENGTH  (HTTP staging removed)
 #define FRITTER_ERROR_INVALID_PARAMETER   10
 #define FRITTER_ERROR_RANDOM              11
 #define FRITTER_ERROR_DLL_FUNCTION        12
@@ -55,5 +55,6 @@
 #define FRITTER_ERROR_MIXED_ASSEMBLY      20
 #define FRITTER_ERROR_HEADERS_INVALID     21
 #define FRITTER_ERROR_DECOY_INVALID       22
+#define FRITTER_ERROR_STATIC_TLS          23
 
 #endif // ERRORS_H

@@ -29,14 +29,38 @@
   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+// The host calls below that take time or load images (runtime start-up,
+// domain creation, assembly load, domain unload) go through the mask stub
+// when there is one: none of their arguments points into the loader or the
+// instance. MaskCall returns the function itself otherwise.
+typedef HRESULT (STDMETHODCALLTYPE *NetStart_t)(PVOID);
+typedef HRESULT (STDMETHODCALLTYPE *NetCreateDomain_t)(PVOID, LPCWSTR, PVOID, PVOID);
+typedef HRESULT (STDMETHODCALLTYPE *NetLoad_t)(PVOID, SAFEARRAY*, PVOID);
+typedef HRESULT (STDMETHODCALLTYPE *NetUnload_t)(PVOID, PVOID);
+
+// Wipe and free a string the loader allocated for an argument.
+static VOID FreeBstr(PFRITTER_INSTANCE inst, BSTR b) {
+    DWORD i;
+    if(b == NULL) return;
+    for(i=0; b[i] != 0; i++) b[i] = 0;
+    inst->api.SysFreeString(b);
+}
+
+// Wipe and free what CommandLineToArgvW returned.
+static VOID FreeArgv(PFRITTER_INSTANCE inst, WCHAR **argv, int argc) {
+    int i, j;
+    if(argv == NULL) return;
+    for(i=0; i<argc; i++)
+      for(j=0; argv[i][j] != 0; j++) argv[i][j] = 0;
+    inst->api.LocalFree((HLOCAL)argv);
+}
+
 BOOL LoadAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY pa) {
     HRESULT         hr = S_OK;
     BSTR            domain;
     SAFEARRAYBOUND  sab;
     SAFEARRAY       *sa;
-    DWORD           i;
     BOOL            loaded=FALSE, loadable;
-    PBYTE           p;
     WCHAR           buf[FRITTER_MAX_NAME];
     
     if(inst->api.CLRCreateInstance != NULL) {
@@ -75,11 +99,18 @@ BOOL LoadAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY
     }
     // fall back on CorBindToRuntime when CLRCreateInstance isn't available
     // or for example when the above code failed.
-    if(FAILED(hr) || inst->api.CLRCreateInstance == NULL) {
+    // pa->icrh == NULL also covers IsLoadable succeeding with loadable ==
+    // FALSE, which leaves hr == S_OK without ever calling GetInterface.
+    if(FAILED(hr) || inst->api.CLRCreateInstance == NULL || pa->icrh == NULL) {
       DPRINT("Trying CorBindToRuntime");
+
+      // ask for the runtime the assembly was built for; with no version
+      // the shim binds the oldest installed runtime (v2 if present)
+      buf[0] = 0;
+      if(mod->runtime[0] != 0) ansi2unicode(inst, mod->runtime, buf);
       
       hr = inst->api.CorBindToRuntime(
-        NULL,  // load whatever's available
+        buf[0] != 0 ? buf : NULL,
         NULL,  // load workstation build
         &inst->xCLSID_CorRuntimeHost,
         &inst->xIID_ICorRuntimeHost,
@@ -88,13 +119,13 @@ BOOL LoadAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY
       DPRINT("HRESULT: %08lx", hr);
     }
     
-    if(FAILED(hr)) {
+    if(FAILED(hr) || pa->icrh == NULL) {
       pa->icrh = NULL;
       return FALSE;
     }
     DPRINT("ICorRuntimeHost::Start");
     
-    hr = pa->icrh->lpVtbl->Start(pa->icrh);
+    hr = ((NetStart_t)MaskCall(inst, (PVOID)pa->icrh->lpVtbl->Start))(pa->icrh);
     
     if(SUCCEEDED(hr)) {     
       // if no domain name specified
@@ -110,7 +141,7 @@ BOOL LoadAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY
       
         DPRINT("ICorRuntimeHost::CreateDomain(\"%ws\")", buf);
       
-        hr = pa->icrh->lpVtbl->CreateDomain(
+        hr = ((NetCreateDomain_t)MaskCall(inst, (PVOID)pa->icrh->lpVtbl->CreateDomain))(
           pa->icrh, domain, NULL, &pa->iu);
         
         inst->api.SysFreeString(domain);
@@ -130,13 +161,11 @@ BOOL LoadAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY
           if(sa != NULL) {
             DPRINT("Copying %" PRIi32 " bytes of assembly to safe array", mod->len);
             
-            for(i=0, p=sa->pvData; i<mod->len; i++) {
-              p[i] = mod->data[i];
-            }
+            Memcpy(sa->pvData, mod->data, mod->len);
 
             DPRINT("AppDomain::Load_3");
-            
-            hr = pa->ad->lpVtbl->Load_3(
+
+            hr = ((NetLoad_t)MaskCall(inst, (PVOID)pa->ad->lpVtbl->Load_3))(
               pa->ad, sa, &pa->as);
             
             loaded = hr == S_OK;
@@ -145,9 +174,8 @@ BOOL LoadAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY
             
             DPRINT("Erasing assembly from memory");
             
-            for(i=0, p=sa->pvData; i<mod->len; i++) {
-              p[i] = mod->data[i] = 0;
-            }
+            Memset(sa->pvData, 0, mod->len);
+            Memset(mod->data,  0, mod->len);
             
             DPRINT("SafeArrayDestroy");
             inst->api.SafeArrayDestroy(sa);
@@ -163,9 +191,10 @@ BOOL RunAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY 
     VARIANT       arg, ret, vtPsa, v1={0}, v2;
     DWORD         i;
     HRESULT       hr;
+    BOOL          mk;
+    PVOID         im;
     BSTR          cls, method;
     ULONG         cnt;
-    OLECHAR       str[1]={0};
     LONG          ucnt, lcnt;
     WCHAR         **argv, buf[FRITTER_MAX_NAME+1];
     int           argc;
@@ -193,6 +222,9 @@ BOOL RunAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY 
           cnt = ucnt - lcnt + 1;
           DPRINT("Number of parameters for entrypoint : %i", cnt);
           
+          inst->api.SafeArrayDestroy(args);   // only the count was needed
+          vtPsa.parray = NULL;
+
           // does Main require string[] args?
           if(cnt != 0) {
             // create a 1 dimensional array for Main parameters
@@ -201,45 +233,55 @@ BOOL RunAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY 
             if(mod->args[0] != 0) {
               ansi2unicode(inst, mod->args, buf);
               argv = inst->api.CommandLineToArgvW(buf, &argc);
+              Memset(buf, 0, sizeof(buf));
+              if(argv == NULL) argc = 0;
               // create 1 dimensional array for strings[] args
               vtPsa.vt     = (VT_ARRAY | VT_BSTR);
               vtPsa.parray = inst->api.SafeArrayCreateVector(VT_BSTR, 0, argc);
-              
-              // add each string parameter
-              for(i=0; i<argc; i++) {  
+
+              // add each string parameter (the array takes a copy)
+              for(i=0; vtPsa.parray != NULL && i<(DWORD)argc; i++) {
                 DPRINT("Adding \"%ws\" as parameter %i", argv[i], (i + 1));
-                inst->api.SafeArrayPutElement(vtPsa.parray, 
-                    &i, inst->api.SysAllocString(argv[i]));
+                cls = inst->api.SysAllocString(argv[i]);
+                inst->api.SafeArrayPutElement(vtPsa.parray, &i, cls);
+                FreeBstr(inst, cls);
               }
+              FreeArgv(inst, argv, argc);
             } else {
-              DPRINT("Adding empty string for invoke_3");
-              // add empty string to make it work
-              // create 1 dimensional array for strings[] args
+              DPRINT("No parameters: passing an empty string[]");
+              // Main(string[] args) with no arguments receives an empty
+              // array, as it would from the command line
               vtPsa.vt     = (VT_ARRAY | VT_BSTR);
-              vtPsa.parray = inst->api.SafeArrayCreateVector(VT_BSTR, 0, 1);
-              
-              i=0;
-              inst->api.SafeArrayPutElement(vtPsa.parray, 
-                    &i, inst->api.SysAllocString(str));
+              vtPsa.parray = inst->api.SafeArrayCreateVector(VT_BSTR, 0, 0);
             }
             // add string array to list of parameters
             i=0;
-            inst->api.SafeArrayPutElement(sav, &i, &vtPsa);
+            if(sav != NULL && vtPsa.parray != NULL)
+              inst->api.SafeArrayPutElement(sav, &i, &vtPsa);
           }
           v1.vt    = VT_NULL;
           v1.plVal = NULL;
-          
+
           DPRINT("MethodInfo::Invoke_3()\n");
-          
-          hr = pa->mi->lpVtbl->Invoke_3(pa->mi, v1, sav, &v2);
+
+          // nothing below needs a protected loader function until the
+          // managed code returns
+          if(cnt != 0 && (sav == NULL || vtPsa.parray == NULL)) {
+            hr = E_OUTOFMEMORY;   // no arguments to call Main with
+          } else if(MaskBase(inst) != NULL) {
+            hr = ((HRESULT (STDMETHODCALLTYPE *)(MethodInfo*, VARIANT, SAFEARRAY*, VARIANT*))
+                  MaskCall(inst, (PVOID)pa->mi->lpVtbl->Invoke_3))(pa->mi, v1, sav, &v2);
+          } else {
+            ParkLoader(inst, PARK_CODE);
+            hr = pa->mi->lpVtbl->Invoke_3(pa->mi, v1, sav, &v2);
+            ParkLoader(inst, PARK_OFF);
+          }
           
           DPRINT("MethodInfo::Invoke_3 : %08lx : %s", 
             hr, SUCCEEDED(hr) ? "Success" : "Failed");
             
-          if(sav != NULL) {
-            inst->api.SafeArrayDestroy(vtPsa.parray);
-            inst->api.SafeArrayDestroy(sav);
-          }
+          if(vtPsa.parray != NULL) inst->api.SafeArrayDestroy(vtPsa.parray);
+          if(sav != NULL)          inst->api.SafeArrayDestroy(sav);
         }
       } else pa->mi = NULL;
     } else {
@@ -263,31 +305,41 @@ BOOL RunAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY 
           if(mod->args[0] != 0) {
             ansi2unicode(inst, mod->args, buf);
             argv = inst->api.CommandLineToArgvW(buf, &argc);
+            Memset(buf, 0, sizeof(buf));
+            if(argv == NULL) argc = 0;
             DPRINT("SafeArrayCreateVector(%li argument(s))", argc);
-            
+
             sav = inst->api.SafeArrayCreateVector(VT_VARIANT, 0, argc);
-          
+
             if(sav != NULL) {
-              for(i=0; i<argc; i++) {
+              for(i=0; i<(DWORD)argc; i++) {
                 DPRINT("Adding \"%ws\" as argument %i", argv[i], (i+1));
-                
+
                 V_BSTR(&arg) = inst->api.SysAllocString(argv[i]);
                 V_VT(&arg)   = VT_BSTR;
-                
+
+                // the array takes a copy
                 hr = inst->api.SafeArrayPutElement(sav, &i, &arg);
-                
+                FreeBstr(inst, V_BSTR(&arg));
+
                 if(FAILED(hr)) {
                   DPRINT("SafeArrayPutElement failed.");
                   inst->api.SafeArrayDestroy(sav);
                   sav = NULL;
+                  break;
                 }
               }
-            }
+            } else hr = E_OUTOFMEMORY;
+            FreeArgv(inst, argv, argc);
           }
           if(SUCCEEDED(hr)) {
             DPRINT("Calling Type::InvokeMember_3");
             
-            hr = pa->type->lpVtbl->InvokeMember_3(
+            mk = (MaskBase(inst) != NULL);
+            im = (PVOID)pa->type->lpVtbl->InvokeMember_3;
+            if(mk) im = MaskCall(inst, im);
+            else   ParkLoader(inst, PARK_CODE);
+            hr = ((HRESULT (STDMETHODCALLTYPE *)(Type*, BSTR, BindingFlags, IBinder*, VARIANT, SAFEARRAY*, VARIANT*))im)(
                 pa->type, 
                 method,   // name of method 
                 BindingFlags_InvokeMethod | 
@@ -297,7 +349,8 @@ BOOL RunAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY 
                 v1,       // empty VARIANT
                 sav,      // arguments to method
                 &ret);    // return code from method
-                         
+            if(!mk) ParkLoader(inst, PARK_OFF);
+
             DPRINT("Type::InvokeMember_3 : %08lx : %s", 
               hr, SUCCEEDED(hr) ? "Success" : "Failed");
               
@@ -339,7 +392,7 @@ VOID FreeAssembly(PFRITTER_INSTANCE inst, PFRITTER_ASSEMBLY pa) {
     
     if(pa->icrh != NULL) {
       DPRINT("ICorRuntimeHost::UnloadDomain");
-      hr = pa->icrh->lpVtbl->UnloadDomain(pa->icrh, (IUnknown*)pa->ad);      
+      hr = ((NetUnload_t)MaskCall(inst, (PVOID)pa->icrh->lpVtbl->UnloadDomain))(pa->icrh, (IUnknown*)pa->ad);      
       DPRINT("HRESULT : %08lX", hr);
       
       DPRINT("ICorRuntimeHost::Stop");

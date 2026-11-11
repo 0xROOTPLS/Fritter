@@ -57,8 +57,8 @@
 #define FRITTER_ERROR_NET_PARAMS           5
 #define FRITTER_ERROR_NO_MEMORY            6
 #define FRITTER_ERROR_INVALID_ARCH         7
-#define FRITTER_ERROR_INVALID_URL          8
-#define FRITTER_ERROR_URL_LENGTH           9
+#define FRITTER_ERROR_RESERVED_8           8  // was INVALID_URL (HTTP staging removed)
+#define FRITTER_ERROR_RESERVED_9           9  // was URL_LENGTH  (HTTP staging removed)
 #define FRITTER_ERROR_INVALID_PARAMETER   10
 #define FRITTER_ERROR_RANDOM              11
 #define FRITTER_ERROR_DLL_FUNCTION        12
@@ -72,6 +72,7 @@
 #define FRITTER_ERROR_MIXED_ASSEMBLY      20
 #define FRITTER_ERROR_HEADERS_INVALID     21
 #define FRITTER_ERROR_DECOY_INVALID       22
+#define FRITTER_ERROR_STATIC_TLS          23
 
 // target architecture
 #define FRITTER_ARCH_X64                   2  // AMD64
@@ -109,17 +110,12 @@
 #define FRITTER_OPT_EXIT_PROCESS           2  // call RtlExitUserProcess to terminate host process
 #define FRITTER_OPT_EXIT_BLOCK             3  // after the main shellcode ends, do not exit or cleanup and block indefinitely
 
-// instance type
-#define FRITTER_INSTANCE_EMBED             1  // Module is embedded
-#define FRITTER_INSTANCE_HTTP              2  // Module is downloaded from remote HTTP/HTTPS server
-
 // Preserve PE headers options
 #define FRITTER_HEADERS_OVERWRITE          1  // Overwrite PE headers
 #define FRITTER_HEADERS_KEEP               2  // Preserve PE headers
 
 #define FRITTER_MAX_NAME                 256  // maximum length of string for domain, class, method and parameter names
 #define FRITTER_MAX_DLL                    8  // maximum number of DLL supported by instance
-#define FRITTER_MAX_MODNAME                8
 #define FRITTER_SIG_LEN                    8  // 64-bit string to verify decryption ok
 #define FRITTER_VER_LEN                   32
 #define FRITTER_DOMAIN_LEN                 8
@@ -149,14 +145,14 @@ typedef struct _FRITTER_CONFIG {
     char            args[FRITTER_MAX_NAME];     // command line to use for unmanaged DLL/EXE and .NET DLL/EXE
     int             unicode;                  // param is passed to DLL function without converting to unicode
     int             chunked;                  // 0=2-stage RW->RX, 1=VEH sliding window (default)
+    int             imgbase;                  // point PEB.ImageBaseAddress at an unmanaged EXE while it runs
+    int             allow_tls;                // accept a payload that uses static thread-local storage (unsupported by the loader)
 
     // module overloading stuff
     char            decoy[2056];              // path of decoy module
-
-    // HTTP staging information
-    char            server[FRITTER_MAX_NAME];   // points to root path of where module will be stored on remote HTTP server
-    char            auth[FRITTER_MAX_NAME];     // username and password for web server
-    char            modname[FRITTER_MAX_NAME];  // name of module written to disk for http stager
+    char            tls_donor[256];           // DLL whose static TLS slot the payload borrows
+    int             key_brute;                // instance key bits left for the loader to find (0 = default, -1 = none)
+    char            key_env[4][256];          // "NAME=VALUE": environment variables the instance key depends on
 
     // FRITTER_MODULE
     int             mod_type;                 // VBS/JS/DLL/EXE
@@ -164,8 +160,7 @@ typedef struct _FRITTER_CONFIG {
     void            *mod;                     // points to FRITTER_MODULE
 
     // FRITTER_INSTANCE
-    int             inst_type;                // FRITTER_INSTANCE_EMBED or FRITTER_INSTANCE_HTTP
-    int             inst_len;                 // size of FRITTER_INSTANCE
+    int             inst_len;               // size of FRITTER_INSTANCE
     void            *inst;                    // points to FRITTER_INSTANCE
 
     // shellcode generated from configuration

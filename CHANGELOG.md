@@ -2,6 +2,77 @@
 
 All notable changes to Fritter since the v1.0 public release. (*Categorized by area*)
 
+## v1.4
+
+Major release. Three themes: what the shellcode looks like in memory while the payload runs, what is constant between outputs, and how many real-world payloads load correctly.
+
+### In-memory footprint
+v1.4 - **Loader mask.** While a payload of any type runs, the shim, the loader and the decrypted instance are encrypted and read/write. One stub page, generated per output, is the only executable page of the shellcode, and no page is writable and executable. About 13 KB of loader code used to stay readable, identical per build. Outputs grow by one page.
+v1.4 - **Mask coverage.** Script-engine callbacks enter through per-output thunks on the stub page and nest on a small return stack; `WScript.Sleep` sleeps masked; the .NET runtime start, domain creation, assembly load and domain unload run masked, not only the invoke; the final block of `-x 3` is masked for .NET and script payloads too.
+v1.4 - **Fallback.** A load that does not start on a page boundary is parked instead: instance pages read/write, code pages read/execute.
+v1.4 - **Instance decrypted in place.** No second allocation, no copy, no ciphertext left behind; three API lookups before decryption are gone.
+v1.4 - **Payload copies.** The payload file is wiped once the image is built (or the assembly or script handed over) and the compressed copy is destroyed after decompression, so the payload exists only as the running image.
+v1.4 - **Payload image.** Mapped as one view per section, each with its final protection (Windows 10 1803+; single view kept as fallback), so the allocation protection is no longer RWX. Mapping, imports and views are three protected functions (all of `RunPE` used to stay readable).
+v1.4 - **DLLs by payload type.** Only the DLLs and APIs a payload type calls are loaded and resolved: native loads nothing beyond kernel32/kernelbase/ntdll, .NET adds oleaut32, mscoree and shell32, scripts ole32 and oleaut32. Every payload used to pull ole32, oleaut32, mscoree and shell32 into the host.
+v1.4 - **Exit path.** A generated exit stub tail-jumps into `VirtualProtect`; no executable page of the shellcode remains after a clean exit.
+v1.4 - **Dispatcher keystream.** Protected sections are XORed with a 32-bit xorshift keystream, shift triple and direction per output, seed per section (was one key byte per section).
+v1.4 - **N>1 per-function dispatch on gcc/mingw.** Linux builds emit the same per-section layout as MSVC; the MinGW slowness of v1.2 is gone.
+
+### Per-output signature surface
+v1.4 - **Outer decoder.** Shim and loader are encoded dword-wise with a 32-bit xorshift keystream, seed and shift triple compiled into the generated decoder (was a repeating 4/8/16-byte XOR whose key followed the stub). Stack-alignment prologue varies its alignment and frame size.
+v1.4 - **Instance header.** Unused API-hash slots are random-filled and the unencrypted words are stored masked (44 bytes were identical in every output).
+v1.4 - **Generated stubs.** The C++ exception stub and the exit stubs written into the payload image are generated per output and placed at a random offset (the former was a fixed 41-byte sequence).
+v1.4 - **Output formats.** C, Ruby, Python, PowerShell and C# outputs draw their variable name and line width per output; Python output is a bytes literal; C# output is wrapped; `-f 4` emits Ruby (was C syntax).
+v1.4 - **.NET AppDomain name.** The default is a pronounceable word of varying length (was 8 random characters); `-d` names are no longer truncated to 8.
+v1.4 - **Result.** No 8-byte sequence is common to all outputs of a build or repeated inside one (`-e 1` excepted by design).
+
+### Instance key and integrity
+v1.4 - **`--key-brute <bits>`** (default 22). That many bits of the instance key are left out of the output and found by trial at load, about 0.1 s; `0` stores the key whole.
+v1.4 - **`--key-host`, `--key-domain`, `--key-user`, `--key-env NAME=VALUE`.** Mix an environment variable of the target into the key. Elsewhere the instance cannot be decrypted and the shellcode returns to the host.
+v1.4 - **Integrity.** One value covers the whole instance, configuration and module, encrypted or not (it covered one string). A per-build checksum is verified after decompression and the unpacker is bounded on input and output. A damaged output is refused instead of run.
+
+### Native payloads (`RunPE`)
+v1.4 - **Exceptions.** Unwind data is registered: SEH and GCC C++ exceptions work, and MSVC C++ exceptions work in statically linked (`/MT`) payloads. `/MD` payloads still cannot catch.
+v1.4 - **Static CRT.** `/MT` payloads no longer abort at startup (the image view was copy-on-write).
+v1.4 - **TLS.** TLS callbacks run (they were skipped). Payloads using static thread-local storage are rejected unless `-l <dll>` lends them the slot of a donor DLL or `-a` overrides (they silently used the host's TLS).
+v1.4 - **Exit.** In every mode except `-x 2`, exit APIs resume the loader on its own thread, which cleans up and returns to the host, and end only the calling thread elsewhere. Covers `TerminateProcess` on the current process, `abort`, and exit functions looked up through `GetProcAddress`.
+v1.4 - **`-b` / `--imagebase`.** The EXE becomes the process image while it runs, so `GetModuleHandle(NULL)` and resource lookups resolve to it (use with `-k 2`).
+v1.4 - **Mapping.** Image relocated for the address it ends up at and rebased if that is taken; writable+executable sections stay executable; a missing import DLL or unresolved import aborts the load; DLLs without an entry point supported; relocation table bounds-checked; handles and buffers released on every path.
+v1.4 - **Command line.** No patching with uninitialised strings when the kernelbase command-line variables are not found.
+
+### .NET and scripts
+v1.4 - **.NET runtime.** `CorBindToRuntime` fallback when the runtime is not loadable (NULL dereference), requesting the assembly's runtime version (was the oldest installed).
+v1.4 - **.NET arguments.** `Main(string[] args)` receives an empty array without `-p` (was one empty string); argument strings are wiped and freed instead of left in the host heap; failed parsing or allocation is no longer dereferenced.
+v1.4 - **VBS/JS.** Script buffer sized from the decompressed length (overflow).
+
+### Decoy (`-j`)
+v1.4 - The payload is checked against the decoy's mapped image size (was its file size, which could pass a decoy too small and write past it).
+v1.4 - Only the pages the payload occupies are replaced; the rest of the decoy keeps the file's contents and protections (the whole image was zeroed). With `-k 1` the decoy's headers are restored at their own size.
+v1.4 - A CFG-built decoy is skipped in a host that enforces CFG (the first callback into the payload ended the host). An over-long decoy path is rejected.
+
+### `-y` / `--fork`
+v1.4 - Fork APIs are resolved before `CreateThread` (two threads raced on the dispatcher), and the host entry point is resumed with the stack aligned as after a `CALL` (the host crashed on its first aligned SSE store).
+
+### Command line and generator
+v1.4 - **Options.** Long options match whole names only; a value starting with `-` is not parsed as a switch; over-long values and unknown switches are errors.
+v1.4 - **Input checks.** PE headers, sections and export table bounds-checked; `mmap`, RNG, `fwrite` and `fclose` failures reported; double free on a failed build fixed.
+v1.4 - **API resolution.** One pass over the loaded modules instead of one export walk per API; DLL-name, forwarder and ordinal bounds checked; the build fails when the API list exceeds the 64 instance slots.
+v1.4 - **Maru.** Input scan bound raised from 64 to 1024 bytes (longer names were truncated before hashing).
+
+### Loader and build internals
+v1.4 - **Dispatcher.** Stack arguments 5-8 are forwarded to protected functions.
+v1.4 - **Entry stub.** Decoder and trampoline use volatile registers only (RBX/RSI/RDI were clobbered).
+v1.4 - **Cleanup.** The shim wipes exactly the loader bytes, including dispatcher and thunks, and is safe at unaligned bases; `VirtualFree` is called with `MEM_RELEASE` and size 0 (every free was failing); the instance is wiped on every failure path.
+v1.4 - **`exe2h` and packer.** A failed pack fails the build instead of emitting an invalid blob; unknown opcodes, references leaving the code sections and too many code sections are fatal; fn/ref tables and the loader section count are validated by `fritter`.
+
+### Removed
+v1.4 - **HTTP staging (`-s` / `-n`).** The module is always embedded. ABI break: `server`, `auth`, `modname`, `inst_type` removed from `FRITTER_CONFIG`.
+v1.4 - **Clipboard copy.** `-f 2` no longer copies the base64 text to the Windows clipboard.
+v1.4 - `loader/veh_shim.c`, `/std:clatest`, 32-bit branches in the loader; `RunPE` rejects non-x64 images; `-g` hidden from help (still accepted).
+
+### Tooling
+v1.4 - **`inject64` test host** leaves target memory RWX (it was flipped to RX, which crashed every target).
+
 ## Function-granular dispatch (retires VEH)
 
 v1.3 - The VEH-based sliding-window model has been replaced end-to-end by a function-granular dispatch system. Each protected loader function has its own PE section, XOR key, and dispatcher. The dispatcher decrypts on entry and wipes on return. No VEH handler, no per-page key material.
@@ -99,10 +170,15 @@ v1.1 - **API table swap** - pre-existing `InternetCloseHandle` / `InternetQueryD
 v1.1 - **Trampoline displacement coupling** - when the decoder -> shim trampoline became variable-size, the decoder's RIP-relative displacement to the encode  d data still used the old hardcoded constant. Fixed; now derived from the actual emitted trampoline size.  
 v1.2 - **MSVC shim cross-page-loop fault storm.** MSVC builds were producing shellcode that ran an order of magnitude slower than expected. Root cause: hot loops in `block_cipher` / `hash_cipher` straddled a page boundary inside the loader's default `.text`, so the VEH sliding window faulted on every loop iteration during instance decrypt and API hash. Resolved by the per-function PE section system + multi-section `exe2h`; each hot routine now sits within its own single-page section. 1-page residual RWX exposure budget preserved.
 
-
 ## Known caveats
 
 v1.1 - `volatile` on auto-storage-duration local variables is not a 100% reliable barrier under -O1 with mingw-w64 GCC. The compiler may place the variable in a register, where the "memory" loads/stores become register reads/writes and the optimizer may fold a salt-XOR-cancel pair. New salt-cancel sites should target variables that are **used downstream** (forces stack spill in functions with high register pressure) and should be validated with deterministic-seed smoke runs covering enough combinations to expose any latent fold.  
 v1.1 - Compression fallback when aPLib doesn't help is deferred. Builds where the input is incompressible may produce slightly larger shellcode than necessary.  
 v1.1 - `__DATE__` / `__TIME__` are still present in the orchestrator source. Reproducible builds require a fixed timezone in the build environment, or a future cleanup that removes the macros.  
 v1.2 - **MinGW build runtime is ~10x slower than MSVC.** Seed-controlled measurement on the bundled calc.exe target: MSVC ~0.6s vs MinGW ~5-7s. Root cause is cross-page hot loops in *untagged* code (`RunPE`, `LoadAssembly`, et al.) inside default `.text` - the per-function-section system covers the explicitly-tagged hash/cipher routines but not the untagged PE-loader machinery, and MinGW's layout of that machinery happens to place hot loops on page boundaries where MSVC's layout doesn't. Both lanes produce OPSEC-equivalent output (no NOP fill on either side); MSVC is the recommended fast lane.
+v1.4 - The v1.2 MinGW runtime caveat above no longer applies: gcc builds use the same per-function layout as MSVC.
+v1.4 - The shellcode still decodes itself in place, so the memory it is given must be writable and executable.
+v1.4 - With `-j`, the loader thread's return address points at the stub page, which is private memory; without a decoy the payload image itself is not file-backed.
+v1.4 - Under the loader mask, a script host method called from a second thread while the first is inside one is not supported.
+v1.4 - `-e 1` outputs share about 20 KB: the instance is unencrypted by design.
+v1.4 - An undecryptable or damaged output generated with `-x 2` still ends the host process.

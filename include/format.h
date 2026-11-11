@@ -41,8 +41,12 @@
 extern "C" {
 #endif
 
+// variable name and bytes per line used by the source formats (drawn per output)
+void format_style(const char *name, int width);
+
 int base64_template(void *pic, uint32_t pic_len, FILE *fd);
 int c_ruby_template(void *pic, uint32_t pic_len, FILE *fd);
+int ruby_template(void *pic, uint32_t pic_len, FILE *fd);
 int py_template(void *pic, uint32_t pic_len, FILE* fd);
 int powershell_template(void *pic, uint32_t pic_len, FILE *fd);
 int csharp_template(void *pic, uint32_t pic_len, FILE *fd);
