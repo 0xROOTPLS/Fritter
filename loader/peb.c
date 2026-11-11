@@ -137,6 +137,45 @@ LPVOID FindReference(PFRITTER_INSTANCE inst, LPVOID original_dll, PCHAR dll_name
   return addr;
 }
 
+// If addr lies inside the export directory of base it is a forwarder
+// string ("MODULE.Function"), not code: resolve what it names.
+// Anything else is returned unchanged.
+LOADER_FN_SECTION(SECTION_HASH_CHAIN)
+static LPVOID ResolveForwarder(PFRITTER_INSTANCE inst, LPVOID base, PIMAGE_EXPORT_DIRECTORY exp, DWORD exp_size, LPVOID addr) {
+  CHAR  dll_name[64];
+  CHAR  api_name[128];
+  DWORD i;
+  PCHAR p;
+
+  if ((PBYTE)addr <  (PBYTE)exp ||
+      (PBYTE)addr >= (PBYTE)exp + exp_size) return addr;
+
+  // copy DLL name to buffer
+  p = (PCHAR)addr;
+
+  for(i=0; p[i] != 0 && p[i] != '.' && i < sizeof(dll_name)-5; i++) {
+    dll_name[i] = p[i];
+  }
+  // no separator, or the module name does not fit
+  if(p[i] != '.') return NULL;
+
+  dll_name[i]   = '.';
+  dll_name[i+1] = 'd';
+  dll_name[i+2] = 'l';
+  dll_name[i+3] = 'l';
+  dll_name[i+4] = 0;
+
+  p += i + 1;
+
+  // copy API name to buffer
+  for(i=0; p[i] != 0 && i < sizeof(api_name)-1; i++) {
+    api_name[i] = p[i];
+  }
+  api_name[i] = 0;
+
+  return FindReference(inst, base, dll_name, api_name);
+}
+
 // search for an export in a DLL
 LOADER_FN_SECTION(SECTION_HASH_CHAIN)
 LPVOID xGetProcAddress(PFRITTER_INSTANCE inst, LPVOID base, PCHAR api_name, DWORD ordinal) {
@@ -150,10 +189,6 @@ LPVOID xGetProcAddress(PFRITTER_INSTANCE inst, LPVOID base, PCHAR api_name, DWOR
   PDWORD                  sym;
   PWORD                   ord;
   PCHAR                   api;
-  CHAR                    dll_name[64];
-  CHAR                    new_api[64];
-  DWORD                   i;
-  PCHAR                   p;
 
   if (base == NULL) return NULL;
 
@@ -186,37 +221,16 @@ LPVOID xGetProcAddress(PFRITTER_INSTANCE inst, LPVOID base, PCHAR api_name, DWOR
     } while (--cnt && addr == NULL);
   } else {
     // exported by ordinal
-    addr = RVA2VA(PVOID, base, adr[ordinal  - exp->Base]);
+    if (ordinal < exp->Base || ordinal - exp->Base >= exp->NumberOfFunctions) return NULL;
+    rva = adr[ordinal - exp->Base];
+    if (rva == 0) return NULL;
+    addr = RVA2VA(PVOID, base, rva);
   }
+
+  if (addr == NULL) return NULL;
 
   // is this a forward reference?
-  if ((PBYTE)addr >= (PBYTE)exp &&
-      (PBYTE)addr <  (PBYTE)exp +
-      dir[IMAGE_DIRECTORY_ENTRY_EXPORT].Size)
-  {
-    // copy DLL name to buffer
-    p=(char*)addr;
-
-    for(i=0; p[i] != 0 && i < sizeof(dll_name)-4; i++) {
-      dll_name[i] = p[i];
-      if(p[i] == '.') break;
-    }
-
-    dll_name[i+1] = 'd';
-    dll_name[i+2] = 'l';
-    dll_name[i+3] = 'l';
-    dll_name[i+4] = 0;
-
-    p += i + 1;
-
-    // copy API name to buffer
-    for(i=0; p[i] != 0 && i < sizeof(new_api)-1;i++) {
-      new_api[i] = p[i];
-    }
-    new_api[i] = 0;
-
-    addr = FindReference(inst, base, dll_name, new_api);
-  }
+  addr = ResolveForwarder(inst, base, exp, dir[IMAGE_DIRECTORY_ENTRY_EXPORT].Size, addr);
   return addr;
 }
 
@@ -232,24 +246,28 @@ LPVOID xGetLibAddress(PFRITTER_INSTANCE inst, PCHAR search) {
     LPVOID                  addr = NULL, base;
     DWORD                   rva;
     PCHAR                   name;
+    PCHAR                   lib = search;
     CHAR                    dll_name[64];
-    DWORD                   i;
+    DWORD                   i, len;
     int                     correct = -1;
 
-    for(i=0; search[i] != 0 && i < 64; i++) {
-      dll_name[i] = search[i];
-    }
-    dll_name[i] = 0;
-    // make sure the name ends with '.dll'
-    if (dll_name[i-4] != '.') {
+    for(len=0; search[len] != 0; len++);
+    if (len == 0) return NULL;
+
+    // make sure the name ends with an extension; append '.dll' if not.
+    // A name too long for the buffer is used as given.
+    if ((len < 4 || search[len-4] != '.') && len + 5 <= sizeof(dll_name)) {
+      Memcpy(dll_name, search, len);
+      i = len;
       dll_name[i++] = '.';
       dll_name[i++] = 'd';
       dll_name[i++] = 'l';
       dll_name[i++] = 'l';
-      dll_name[i++] = 0;
+      dll_name[i]   = 0;
+      lib = dll_name;
     }
 
-    DPRINT("Searching for DLL in PEB: %s", dll_name);
+    DPRINT("Searching for DLL in PEB: %s", lib);
 
     peb = GET_PEB();
     ldr = (PPEB_LDR_DATA)peb->Ldr;
@@ -268,7 +286,7 @@ LPVOID xGetLibAddress(PFRITTER_INSTANCE inst, PCHAR search) {
       exp  = RVA2VA(PIMAGE_EXPORT_DIRECTORY, base, rva);
       name = RVA2VA(PCHAR, base, exp->Name);
 
-      correct = stricmp(dll_name, name);
+      correct = stricmp(lib, name);
 
       if (correct == 0) {
         addr = base;
@@ -279,8 +297,8 @@ LPVOID xGetLibAddress(PFRITTER_INSTANCE inst, PCHAR search) {
 
     // if the DLL was not found, load it
     if (addr == NULL) {
-      addr = inst->api.LoadLibraryA(dll_name);
-      DPRINT("Dll not found. Loaded %s via LoadLibrary at 0x%p", dll_name, addr);
+      addr = inst->api.LoadLibraryA(lib);
+      DPRINT("Dll not found. Loaded %s via LoadLibrary at 0x%p", lib, addr);
     }
     return addr;
 }
@@ -296,10 +314,10 @@ LPVOID FindExport(PFRITTER_INSTANCE inst, LPVOID base, ULONG64 api_hash, ULONG64
     PDWORD                  adr;
     PDWORD                  sym;
     PWORD                   ord;
-    PCHAR                   api, dll, p;
+    PCHAR                   api, dll;
     LPVOID                  addr=NULL;
     ULONG64                 dll_hash;
-    CHAR                    buf[MAX_PATH], dll_name[64], api_name[128];
+    CHAR                    buf[MAX_PATH];
 
     dos = (PIMAGE_DOS_HEADER)base;
     nt  = RVA2VA(PIMAGE_NT_HEADERS, base, dos->e_lfanew);
@@ -321,7 +339,7 @@ LPVOID FindExport(PFRITTER_INSTANCE inst, LPVOID base, ULONG64 api_hash, ULONG64
     dll = RVA2VA(PCHAR, base, exp->Name);
 
     // get hash of DLL string converted to lowercase
-    for(i=0;dll[i]!=0;i++) {
+    for(i=0;dll[i]!=0 && i<MAX_PATH-1;i++) {
       buf[i] = dll[i] | 0x20;
     }
     buf[i] = 0;
@@ -336,33 +354,7 @@ LPVOID FindExport(PFRITTER_INSTANCE inst, LPVOID base, ULONG64 api_hash, ULONG64
         addr = RVA2VA(LPVOID, base, adr[ord[cnt-1]]);
 
         // is this a forward reference?
-        if ((PBYTE)addr >= (PBYTE)exp &&
-            (PBYTE)addr <  (PBYTE)exp +
-            dir[IMAGE_DIRECTORY_ENTRY_EXPORT].Size)
-        {
-          // copy DLL name to buffer
-          p=(char*)addr;
-
-          for(i=0; p[i] != 0 && i < sizeof(dll_name)-4; i++) {
-            dll_name[i] = p[i];
-            if(p[i] == '.') break;
-          }
-
-          dll_name[i+1] = 'd';
-          dll_name[i+2] = 'l';
-          dll_name[i+3] = 'l';
-          dll_name[i+4] = 0;
-
-          p += i + 1;
-
-          // copy API name to buffer
-          for(i=0; p[i] != 0 && i < sizeof(api_name)-1;i++) {
-            api_name[i] = p[i];
-          }
-          api_name[i] = 0;
-
-          addr = FindReference(inst, base, dll_name, api_name);
-        }
+        addr = ResolveForwarder(inst, base, exp, dir[IMAGE_DIRECTORY_ENTRY_EXPORT].Size, addr);
         return addr;
       }
     } while (--cnt && addr == NULL);
@@ -390,4 +382,83 @@ LPVOID xGetProcAddressByHash(PFRITTER_INSTANCE inst, ULONG64 ulHash, ULONG64 ulI
       addr = FindExport(inst, dte->DllBase, ulHash, ulIV);
     }
     return addr;
+}
+
+// Resolve inst->api slots [1, count) in a single pass: every export of
+// every loaded module is hashed once and compared with all slots still
+// open, instead of one full walk per API. Returns a bit mask of the
+// slots that now hold an address; the others still hold their hash.
+LOADER_FN_SECTION(SECTION_HASH_CHAIN)
+ULONG64 xResolveApis(PFRITTER_INSTANCE inst, DWORD count) {
+    PPEB                    peb;
+    PPEB_LDR_DATA           ldr;
+    PLDR_DATA_TABLE_ENTRY   dte;
+    PIMAGE_DOS_HEADER       dos;
+    PIMAGE_NT_HEADERS       nt;
+    PIMAGE_DATA_DIRECTORY   dir;
+    PIMAGE_EXPORT_DIRECTORY exp;
+    PDWORD                  adr, sym;
+    PWORD                   ord;
+    PCHAR                   dll;
+    LPVOID                  base, addr;
+    DWORD                   i, j, cnt, rva;
+    ULONG64                 dll_hash, h, done = 0, want;
+    CHAR                    buf[MAX_PATH];
+
+    if (count > 64) count = 64;
+    if (count < 2) return 0;
+
+    // bits 1..count-1
+    want = (count == 64) ? ~(ULONG64)1 : ((((ULONG64)1 << count) - 1) & ~(ULONG64)1);
+    // slots this payload type does not use
+    want &= ~inst->api_skip;
+
+    peb = GET_PEB();
+    ldr = (PPEB_LDR_DATA)peb->Ldr;
+
+    for (dte = PEB_ENTRY_TO_DTE(PEB_HEAD_LINK(ldr));
+         dte->DllBase != NULL && done != want;
+         dte = PEB_NEXT_DTE(dte))
+    {
+      base = dte->DllBase;
+      dos  = (PIMAGE_DOS_HEADER)base;
+      nt   = RVA2VA(PIMAGE_NT_HEADERS, base, dos->e_lfanew);
+      dir  = (PIMAGE_DATA_DIRECTORY)nt->OptionalHeader.DataDirectory;
+      rva  = dir[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+      if (rva == 0) continue;
+
+      exp = RVA2VA(PIMAGE_EXPORT_DIRECTORY, base, rva);
+      cnt = exp->NumberOfNames;
+      if (cnt == 0) continue;
+
+      adr = RVA2VA(PDWORD,base, exp->AddressOfFunctions);
+      sym = RVA2VA(PDWORD,base, exp->AddressOfNames);
+      ord = RVA2VA(PWORD, base, exp->AddressOfNameOrdinals);
+      dll = RVA2VA(PCHAR, base, exp->Name);
+
+      // hash of the DLL name in lowercase, once per module
+      for(i=0; dll[i]!=0 && i<MAX_PATH-1; i++) {
+        buf[i] = dll[i] | 0x20;
+      }
+      buf[i] = 0;
+      dll_hash = maru(buf, inst->iv);
+
+      for (j=0; j<cnt && done != want; j++) {
+        h = maru(RVA2VA(PCHAR, base, sym[j]), inst->iv) ^ dll_hash;
+
+        for (i=1; i<count; i++) {
+          if (((done | ~want) >> i) & 1) continue;
+          if (inst->api.hash[i] != h) continue;
+
+          addr = RVA2VA(LPVOID, base, adr[ord[j]]);
+          addr = ResolveForwarder(inst, base, exp, dir[IMAGE_DIRECTORY_ENTRY_EXPORT].Size, addr);
+          if (addr != NULL) {
+            inst->api.addr[i] = addr;
+            done |= (ULONG64)1 << i;
+          }
+          break;
+        }
+      }
+    }
+    return done;
 }

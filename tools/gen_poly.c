@@ -119,6 +119,11 @@ int main(int argc, char **argv) {
        zero-fill cleanup. Defeats the "freshly-zeroed RWX pages + zeroed
        VEH_CTX struct" forensic fingerprint when non-zero. */
     uint8_t  shim_wipe = (uint8_t)(xorshift32(&s) & 0xFFu);
+    /* Module checksum: odd multiplier, start value and rotation, so the
+       loop carries no fixed constants. */
+    uint32_t sum_mul  = xorshift32(&s) | 1u;
+    uint32_t sum_seed = xorshift32(&s);
+    uint32_t sum_rot  = 1u + (xorshift32(&s) % 31u);
 
     FILE *f = fopen(out_path, "w");
     if (!f) {
@@ -146,6 +151,9 @@ int main(int argc, char **argv) {
     fprintf(f, "#define LOADER_PEB_DIR   %u\n", loader_peb_dir);
     fprintf(f, "#define LOADER_POLY_SALT 0x%08Xu\n", loader_salt);
     fprintf(f, "#define SHIM_WIPE_BYTE   0x%02Xu\n", shim_wipe);
+    fprintf(f, "#define SUM_MUL    0x%08Xu\n", sum_mul);
+    fprintf(f, "#define SUM_SEED   0x%08Xu\n", sum_seed);
+    fprintf(f, "#define SUM_ROT    %u\n", sum_rot);
     fprintf(f, "#endif\n");
     fclose(f);
 

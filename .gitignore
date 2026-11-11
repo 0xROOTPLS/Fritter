@@ -84,3 +84,8 @@ Thumbs.db
 
 # Build logs
 *.log
+
+# Local test tooling, not part of the published tree
+tools/regress.py
+tools/opsec.py
+test/payloads/

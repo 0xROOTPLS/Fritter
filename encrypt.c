@@ -91,6 +91,30 @@ void fritter_encrypt(void *mk, void *ctr, void *data, uint32_t len) {
     }
 }
 
+LOADER_FN_SECTION(SECTION_CIPHER)
+uint64_t fritter_keychk(void *mk, void *ctr) {
+    uint32_t x[CIPHER_BLK_LEN / 4], *c = (uint32_t*)ctr, i;
+
+    // the inverted counter block: counter mode never encrypts it
+    for(i=0;i<CIPHER_BLK_LEN/4;i++) x[i] = ~c[i];
+    ENCRYPT(mk, x);
+    return ((uint64_t)x[1] << 32) | x[0];
+}
+
+LOADER_FN_SECTION(SECTION_CIPHER)
+int fritter_keyfind(void *mk, void *ctr, uint64_t chk, uint32_t bits) {
+    uint32_t *k = (uint32_t*)mk, base = k[0], n = 0;
+    uint32_t mask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1);
+
+    // candidates start at the (random) bits stored in their place
+    do {
+      k[0] = (base & ~mask) | ((base + n) & mask);
+      if(fritter_keychk(mk, ctr) == chk) return 1;
+    } while(n++ != mask);
+    k[0] = base;
+    return 0;
+}
+
 #ifdef TEST
 
 #include <stdint.h>

@@ -107,6 +107,19 @@ uint64_t maru(const void *input, uint64_t iv) {
     return h;
 }
 
+// Checksum of the module contents; constants are per build.
+LOADER_FN_SECTION(SECTION_HASH_CHAIN)
+uint32_t mod_sum(const void *data, uint32_t len) {
+    const uint8_t *p = (const uint8_t*)data;
+    uint32_t h = SUM_SEED, i;
+
+    for(i=0; i<len; i++) {
+      h = (h ^ p[i]) * SUM_MUL;
+      h = ROTL32(h, SUM_ROT);
+    }
+    return h;
+}
+
 #ifdef TEST
 
 #include <stdint.h>

@@ -1,6 +1,10 @@
 /*
  * Compressed stream unpacker.
  * Produces identical output to the aPLib decompressor.
+ *
+ * Bounded: never reads past the source or writes outside the
+ * destination. Returns the number of bytes produced, or 0 if the
+ * stream is malformed or does not fit.
  */
 
 #include "depack.h"
@@ -9,10 +13,24 @@
 /* stream reader state */
 struct StreamCtx {
   const unsigned char *src;
+  const unsigned char *src_end;
   unsigned char *dst;
+  unsigned char *dst_start;
+  unsigned char *dst_end;
   unsigned int bits;
   unsigned int avail;
+  unsigned int bad;
 };
+
+/* next source byte; flags the stream as bad when exhausted */
+static unsigned int pull_byte(struct StreamCtx *ctx)
+{
+  if (ctx->src >= ctx->src_end) {
+    ctx->bad = 1;
+    return 0;
+  }
+  return *ctx->src++;
+}
 
 /* pull one bit from the stream */
 static unsigned int pull_bit(struct StreamCtx *ctx)
@@ -20,7 +38,7 @@ static unsigned int pull_bit(struct StreamCtx *ctx)
   unsigned int b;
 
   if (ctx->avail == 0) {
-    ctx->bits = *ctx->src++;
+    ctx->bits = pull_byte(ctx);
     ctx->avail = 8;
   }
 
@@ -31,7 +49,7 @@ static unsigned int pull_bit(struct StreamCtx *ctx)
   return b;
 }
 
-/* decode a gamma2 value */
+/* decode a gamma2 value (an exhausted stream reads as zero bits and ends it) */
 static unsigned int decode_gamma(struct StreamCtx *ctx)
 {
   unsigned int val = 1;
@@ -45,10 +63,27 @@ static unsigned int decode_gamma(struct StreamCtx *ctx)
   return val;
 }
 
+/* append one byte to the output */
+static void put_byte(struct StreamCtx *ctx, unsigned int v)
+{
+  if (ctx->dst >= ctx->dst_end) {
+    ctx->bad = 1;
+    return;
+  }
+  *ctx->dst++ = (unsigned char)v;
+}
+
 /* copy len bytes from (dst - offset) to dst */
 static void copy_match(struct StreamCtx *ctx, unsigned int offset, unsigned int len)
 {
   unsigned int k;
+
+  if (offset == 0 ||
+      offset > (unsigned int)(ctx->dst - ctx->dst_start) ||
+      len    > (unsigned int)(ctx->dst_end - ctx->dst)) {
+    ctx->bad = 1;
+    return;
+  }
   for (k = 0; k < len; k++) {
     *ctx->dst = *(ctx->dst - offset);
     ctx->dst++;
@@ -56,7 +91,8 @@ static void copy_match(struct StreamCtx *ctx, unsigned int offset, unsigned int 
 }
 
 LOADER_FN_SECTION(".aP_depack")
-unsigned int aP_depack(const void *source, void *destination)
+unsigned int aP_depack(const void *source, unsigned int srclen,
+                       void *destination, unsigned int dstlen)
 {
   struct StreamCtx ctx;
   unsigned int prev_offset, last_was_match;
@@ -65,21 +101,25 @@ unsigned int aP_depack(const void *source, void *destination)
   unsigned int nibble;
 
   ctx.src = (const unsigned char *)source;
+  ctx.src_end = ctx.src + srclen;
   ctx.dst = (unsigned char *)destination;
+  ctx.dst_start = ctx.dst;
+  ctx.dst_end = ctx.dst + dstlen;
   ctx.avail = 0;
   ctx.bits = 0;
+  ctx.bad = 0;
 
   prev_offset = (unsigned int)-1;
   last_was_match = 0;
   running = 1;
 
   /* literal first byte */
-  *ctx.dst++ = *ctx.src++;
+  put_byte(&ctx, pull_byte(&ctx));
 
-  while (running) {
+  while (running && !ctx.bad) {
     /* bit 0: literal */
     if (!pull_bit(&ctx)) {
-      *ctx.dst++ = *ctx.src++;
+      put_byte(&ctx, pull_byte(&ctx));
       last_was_match = 0;
       continue;
     }
@@ -99,7 +139,7 @@ unsigned int aP_depack(const void *source, void *destination)
         else
           offset -= 2;
 
-        offset = (offset << 8) | *ctx.src++;
+        offset = (offset << 8) | pull_byte(&ctx);
         length = decode_gamma(&ctx);
 
         if (offset >= 32000) length++;
@@ -115,7 +155,7 @@ unsigned int aP_depack(const void *source, void *destination)
 
     /* bit 1,1,0: short match */
     if (!pull_bit(&ctx)) {
-      nibble = *ctx.src++;
+      nibble = pull_byte(&ctx);
       length = 2 + (nibble & 1);
       offset = nibble >> 1;
 
@@ -138,14 +178,15 @@ unsigned int aP_depack(const void *source, void *destination)
     }
 
     if (offset != 0) {
-      *ctx.dst = *(ctx.dst - offset);
-      ctx.dst++;
+      copy_match(&ctx, offset, 1);
     } else {
-      *ctx.dst++ = 0x00;
+      put_byte(&ctx, 0x00);
     }
 
     last_was_match = 0;
   }
 
-  return (unsigned int)(ctx.dst - (unsigned char *)destination);
+  if (ctx.bad) return 0;
+
+  return (unsigned int)(ctx.dst - ctx.dst_start);
 }

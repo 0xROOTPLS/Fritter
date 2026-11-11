@@ -147,17 +147,12 @@ typedef struct _GUID {
 #define FRITTER_OPT_EXIT_PROCESS           2  // after the main shellcode ends, call RtlExitUserProcess to terminate host process
 #define FRITTER_OPT_EXIT_BLOCK             3  // after the main shellcode ends, do not exit or cleanup and block indefinitely
 
-// instance type
-#define FRITTER_INSTANCE_EMBED             1  // Module is embedded
-#define FRITTER_INSTANCE_HTTP              2  // Module is downloaded from remote HTTP/HTTPS server
-
 // Preserve PE headers options
 #define FRITTER_HEADERS_OVERWRITE          1  // Overwrite PE headers
 #define FRITTER_HEADERS_KEEP               2  // Preserve PE headers
 
 #define FRITTER_MAX_NAME                 256  // maximum length of string for domain, class, method and parameter names
 #define FRITTER_MAX_DLL                    8  // maximum number of DLL supported by instance
-#define FRITTER_MAX_MODNAME                8
 #define FRITTER_SIG_LEN                    8  // 64-bit string to verify decryption ok
 #define FRITTER_VER_LEN                   32
 #define FRITTER_DOMAIN_LEN                 8
@@ -167,12 +162,12 @@ typedef struct _GUID {
 
 #define NTDLL_DLL    "ntdll.dll"
 #define KERNEL32_DLL "kernel32.dll"
+#define KERNELBASE_DLL "kernelbase.dll"
 #define ADVAPI32_DLL "advapi32.dll"
 #define CRYPT32_DLL  "crypt32.dll"
 #define MSCOREE_DLL  "mscoree.dll"
 #define OLE32_DLL    "ole32.dll"
 #define OLEAUT32_DLL "oleaut32.dll"
-#define WININET_DLL  "wininet.dll"
 #define COMBASE_DLL  "combase.dll"
 #define USER32_DLL   "user32.dll"
 #define SHLWAPI_DLL  "shlwapi.dll"
@@ -225,16 +220,53 @@ typedef struct _FRITTER_MODULE {
     
     char     args[FRITTER_MAX_NAME];            // string arguments for both managed and unmanaged DLL/EXE
     int      unicode;                         // convert param to unicode for unmanaged DLL function
+    int      imgbase;                         // point PEB.ImageBaseAddress at an unmanaged EXE while it runs
     
     char     sig[FRITTER_SIG_LEN];              // string to verify decryption
     uint64_t mac;                             // hash of sig, to verify decryption was ok
     
     uint32_t zlen;                            // compressed size of EXE/DLL/JS/VBS file
     uint32_t len;                             // real size of EXE/DLL/JS/VBS file
+    uint32_t sum;                             // checksum of the real file contents
     uint8_t  data[4];                         // data of EXE/DLL/JS/VBS file
 } FRITTER_MODULE, *PFRITTER_MODULE;
 
 // everything required for an instance goes into the following structure
+// Mask stub page (last page of the shellcode): qword slots at its start.
+// The first holds the offsets of its two entries (call, exit) as words.
+#define FRITTER_MASK_TARGET  1   // function the call entry forwards to
+#define FRITTER_MASK_VP      2   // VirtualProtect
+#define FRITTER_MASK_PBASE   3   // first page that loses execute while masked
+#define FRITTER_MASK_PLEN    4   // bytes from there to the stub page
+#define FRITTER_MASK_HOOK    5   // exit entry: where the entering thread goes
+#define FRITTER_MASK_TID     6   // exit entry: id of the entering thread
+#define FRITTER_MASK_THREAD  7   // exit entry: where any other thread goes
+#define FRITTER_MASK_RET     8   // stub's own: return address, four arguments, state
+#define FRITTER_MASK_ARGS    9
+#define FRITTER_MASK_FLAG    13
+#define FRITTER_MASK_IBASE   14  // second masked range: the instance
+#define FRITTER_MASK_ICNT    15  // its length in dwords (0: none)
+#define FRITTER_MASK_SP      16  // return stack: entries in use
+#define FRITTER_MASK_IRET    17  // inbound entry: where it returns to
+#define FRITTER_MASK_NIN     18  // inbound thunks handed out
+#define FRITTER_MASK_STK     19  // return stack (masked calls and inbound calls nest)
+#define FRITTER_MASK_NSTK    8
+#define FRITTER_MASK_TGT     27  // inbound thunk targets
+#define FRITTER_MASK_NTGT    56
+#define FRITTER_MASK_SLOTS   83
+
+#define FRITTER_KEY_ENVS            4    // environment variables a key can depend on
+#define FRITTER_KEY_BRUTE_DEFAULT   22   // key bits the loader has to find by trial unless told otherwise
+#define FRITTER_KEY_BRUTE_MAX       32
+
+// Integrity value of an instance: the hash of sig, combined with checksums
+// of everything from api_cnt up to mac and of the module after it.
+#define FRITTER_MAC(inst) (maru((inst)->sig, (inst)->iv) ^ \
+    (uint64_t)mod_sum(&(inst)->api_cnt, (uint32_t)(offsetof(FRITTER_INSTANCE, mac) - offsetof(FRITTER_INSTANCE, api_cnt))) ^ \
+    ((uint64_t)mod_sum(&(inst)->module, (inst)->len - (uint32_t)offsetof(FRITTER_INSTANCE, module)) << 32))
+
+#define FRITTER_PLAIN_MASK(inst, n) ((uint32_t)((inst)->iv >> ((n) * 8)))
+
 typedef struct _FRITTER_INSTANCE {
     uint32_t    len;                          // total size of instance
     FRITTER_CRYPT key;                          // decrypts instance if encryption enabled
@@ -258,12 +290,26 @@ typedef struct _FRITTER_INSTANCE {
       #endif
     } api;
     
+    // The five words below are read before the instance is decrypted. They
+    // are stored xor a slice of the hash IV (FRITTER_PLAIN_MASK), so that
+    // default settings do not leave the same bytes in every output.
     int         exit_opt;                     // 1 to call RtlExitUserProcess and terminate the host process, 2 to never exit or cleanup and block
     int         entropy;                      // indicates entropy level
     uint32_t    oep;                          // original entrypoint
+    uint32_t    pic_off;                      // offset of this instance inside the shellcode
+    uint32_t    pic_len;                      // total size of the shellcode
+    uint64_t    hook;                         // exit hook block inside the shim (set by the loader)
     
+    // Instance key options (--key-*). With any of them the key above is not
+    // the key: kopt says what is missing (also stored xor FRITTER_PLAIN_MASK).
+    uint16_t    kopt;                         // low byte: key bits left out; bits 8..11: kenv slots in use
+    uint16_t    kpad[3];                      // random
+    uint64_t    kchk;                         // check value of the real key
+    uint64_t    kenv[FRITTER_KEY_ENVS];       // name hashes of the environment variables mixed into the key
+
     // everything from here is encrypted
     int         api_cnt;                      // the 64-bit hashes of API required for instance to work
+    uint64_t    api_skip;                     // API slots this payload type does not use (left unresolved)
     char        dll_names[FRITTER_MAX_NAME];    // a list of DLL strings to load, separated by semi-colon
     
     char        dataname[8];                  // ".data"
@@ -273,11 +319,34 @@ typedef struct _FRITTER_INSTANCE {
     char        exit_api[FRITTER_MAX_NAME];     // exit-related API
     
     int         headers;                      // indicates whether to overwrite PE headers
+    uint64_t    pcfh_hash;                    // maru hash of "RtlPcToFileHeader" (import redirected for C++ EH)
+    uint8_t     eh_stub[128];                 // generated stub that answers RtlPcToFileHeader for the payload image
+    uint8_t     eh_len;                       // its length
+    uint8_t     eh_base;                      // offset of the image base (imm64)
+    uint8_t     eh_size;                      // offset of the image size (imm32)
+    uint8_t     eh_real;                      // offset of the real function (imm64)
+    uint32_t    eh_pos;                       // random draw for where the stub is placed
+    uint64_t    eh_key[2];                    // the two imm64 values are stored xor these
+    uint64_t    gpa_hash;                     // maru hash of "GetProcAddress"
+    uint64_t    term_hash;                    // maru hash of "TerminateProcess"
+    uint8_t     tp_stub[64];                  // generated stub that stands in for TerminateProcess
+    uint8_t     tp_len;                       // its length
+    uint8_t     tp_exit;                      // offset of the exit replacement (imm64)
+    uint8_t     tp_real;                      // offset of the real function (imm64)
+    uint8_t     gp_stub[128];                 // generated stub that stands in for GetProcAddress
+    uint8_t     gp_len;                       // its length
+    uint8_t     gp_real;                      // offset of the real function (imm64)
+    uint8_t     gp_frame;                     // bytes of stack it allocates (for its unwind data)
+    uint8_t     gp_from[3];                   // offsets of the results it swaps (imm64) ...
+    uint8_t     gp_to[3];                     // ... and of what it returns instead (imm64)
+    uint8_t     mask;                         // the shellcode ends with a mask stub page
+    uint64_t    pic_base;                     // runtime address of the shellcode (set by the loader)
     
     char        wscript[8];                   // WScript
     char        wscript_exe[12];              // wscript.exe
 
     char        decoy[MAX_PATH * 2];            // path of decoy module
+    char        tls_donor[FRITTER_MAX_NAME];    // DLL whose static TLS slot the payload borrows
 
     GUID        xIID_IUnknown;
     GUID        xIID_IDispatch;
@@ -299,21 +368,13 @@ typedef struct _FRITTER_INSTANCE {
     GUID        xIID_IActiveScriptParse32;     // parser
     GUID        xIID_IActiveScriptParse64;
     
-    int         type;                       // FRITTER_INSTANCE_EMBED, FRITTER_INSTANCE_HTTP 
-    char        server[FRITTER_MAX_NAME];     // staging server hosting fritter module
-    char        username[FRITTER_MAX_NAME];   // username for web server
-    char        password[FRITTER_MAX_NAME];   // password for web server
-    char        http_req[8];                // just a buffer for "GET"
-
     uint8_t     sig[FRITTER_MAX_NAME];        // string to hash
-    uint64_t    mac;                        // to verify decryption ok
-    
-    FRITTER_CRYPT mod_key;       // used to decrypt module
-    uint64_t    mod_len;       // total size of module
-    
-    union {
-      PFRITTER_MODULE p;         // Memory allocated for module downloaded via DNS or HTTP
-      FRITTER_MODULE  x;         // Module is embedded
+    uint64_t    mac;                        // FRITTER_MAC: verifies decryption and every byte from api_cnt on
+
+    // The module is always embedded at the tail of the instance and is
+    // covered by the instance encryption. (HTTP staging was removed.)
+    struct {
+      FRITTER_MODULE  x;
     } module;
 } FRITTER_INSTANCE, *PFRITTER_INSTANCE;
 
@@ -342,14 +403,14 @@ typedef struct _FRITTER_CONFIG {
     char            args[FRITTER_MAX_NAME];    // command line to use for unmanaged DLL/EXE and .NET DLL/EXE
     int             unicode;                  // param is passed to DLL function without converting to unicode
     int             chunked;                  // 0=2-stage RW->RX, 1=VEH sliding window (default)
+    int             imgbase;                  // point PEB.ImageBaseAddress at an unmanaged EXE while it runs
+    int             allow_tls;                // accept a payload that uses static thread-local storage (unsupported by the loader)
 
     // module overloading stuff
     char            decoy[2056];                  // path of decoy module
-    
-    // HTTP/DNS staging information
-    char            server[FRITTER_MAX_NAME];   // points to root path of where module will be stored on remote HTTP server or DNS server
-    char            auth[FRITTER_MAX_NAME];     // username and password for web server
-    char            modname[FRITTER_MAX_NAME];  // name of module written to disk for http stager
+    char            tls_donor[256];           // DLL whose static TLS slot the payload borrows
+    int             key_brute;                // instance key bits left for the loader to find (0 = default, -1 = none)
+    char            key_env[4][256];          // "NAME=VALUE": environment variables the instance key depends on
     
     // FRITTER_MODULE
     int             mod_type;                 // VBS/JS/DLL/EXE
@@ -357,8 +418,7 @@ typedef struct _FRITTER_CONFIG {
     FRITTER_MODULE    *mod;                     // points to FRITTER_MODULE
     
     // FRITTER_INSTANCE
-    int             inst_type;                // FRITTER_INSTANCE_EMBED or FRITTER_INSTANCE_HTTP
-    int             inst_len;                 // size of FRITTER_INSTANCE
+    int             inst_len;               // size of FRITTER_INSTANCE
     FRITTER_INSTANCE  *inst;                    // points to FRITTER_INSTANCE
     
     // shellcode generated from configuration

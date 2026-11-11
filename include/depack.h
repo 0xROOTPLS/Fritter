@@ -21,7 +21,9 @@ extern "C" {
 #endif
 
 /* function prototype */
-unsigned int aP_depack(const void *source, void *destination);
+/* Bounded: returns bytes written, or 0 on a malformed stream. */
+unsigned int aP_depack(const void *source, unsigned int srclen,
+                       void *destination, unsigned int dstlen);
 
 #ifdef __cplusplus
 } /* extern "C" */

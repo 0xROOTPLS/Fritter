@@ -20,8 +20,9 @@
  *      cross-section disp32.
  *
  * The LDE covers the subset MSVC /Os /O1 emits for our codebase.
- * Any undecodable byte aborts the pack and falls through to the
- * original RVA-preserving (NOP-fill) extraction.
+ * Any opcode it does not know aborts the pack, and exe2h then fails
+ * the build: a guessed length would desync the walk and silently
+ * produce wrong fixups.
  */
 
 #ifndef FRITTER_EXE2H_PACK_H
@@ -47,6 +48,8 @@
 
 static uint8_t LDE_OP1[256];
 static uint8_t LDE_OP2[256];
+static uint8_t LDE_OK1[256];   /* 1 = opcode is known to the decoder */
+static uint8_t LDE_OK2[256];
 static int LDE_INITED = 0;
 
 static void lde_init_tables(void) {
@@ -99,6 +102,7 @@ static void lde_init_tables(void) {
   /* CF 0 */
   for(b = 0xD0; b <= 0xD3; b++) LDE_OP1[b] = LDE_F_MODRM;
   /* D7 0 */
+  for(b = 0xD8; b <= 0xDF; b++) LDE_OP1[b] = LDE_F_MODRM;  /* x87 */
   for(b = 0xE0; b <= 0xE3; b++) LDE_OP1[b] = LDE_F_REL8;
   LDE_OP1[0xE4] = LDE_F_IB;
   LDE_OP1[0xE5] = LDE_F_IB;
@@ -127,6 +131,8 @@ static void lde_init_tables(void) {
   /* 30-37 zero-operand */
   for(b = 0x40; b <= 0x4F; b++) LDE_OP2[b] = LDE_F_MODRM;
   for(b = 0x50; b <= 0x7F; b++) LDE_OP2[b] = LDE_F_MODRM;
+  for(b = 0x70; b <= 0x73; b++) LDE_OP2[b] = LDE_F_MODRM | LDE_F_IB; /* pshuf*, shift groups */
+  LDE_OP2[0x77] = 0;                                                 /* emms: no ModR/M */
   for(b = 0x80; b <= 0x8F; b++) LDE_OP2[b] = LDE_F_REL32;
   for(b = 0x90; b <= 0x9F; b++) LDE_OP2[b] = LDE_F_MODRM;
   /* A0-A2 zero-operand */
@@ -153,6 +159,29 @@ static void lde_init_tables(void) {
   LDE_OP2[0xC7] = LDE_F_MODRM;
   /* C8-CF BSWAP zero-operand */
   for(b = 0xD0; b <= 0xFF; b++) LDE_OP2[b] = LDE_F_MODRM;
+
+  /* Known-opcode maps. Anything with flags is known; operand-less
+     opcodes are listed explicitly. Everything else (VEX/EVEX, opcodes
+     invalid in long mode, anything unlisted) is rejected. */
+  {
+    static const uint8_t ok1_noflag[] = {
+      0x6C,0x6D,0x6E,0x6F, 0x90,0x91,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,
+      0x9B,0x9C,0x9D,0x9E,0x9F, 0xA0,0xA1,0xA2,0xA3, 0xA4,0xA5,0xA6,0xA7,
+      0xAA,0xAB,0xAC,0xAD,0xAE,0xAF, 0xC3,0xC9,0xCB,0xCC,0xCF,0xD7,
+      0xEC,0xED,0xEE,0xEF, 0xF1,0xF4,0xF5, 0xF8,0xF9,0xFA,0xFB,0xFC,0xFD };
+    static const uint8_t ok2_noflag[] = {
+      0x05,0x06,0x07,0x08,0x09,0x0B, 0x30,0x31,0x32,0x33,0x34,0x35, 0x77,
+      0xA0,0xA1,0xA2,0xA8,0xA9,0xAA, 0xC8,0xC9,0xCA,0xCB,0xCC,0xCD,0xCE,0xCF };
+    size_t k;
+    for(b = 0; b < 256; b++) {
+      LDE_OK1[b] = (LDE_OP1[b] != 0);
+      LDE_OK2[b] = (LDE_OP2[b] != 0);
+    }
+    for(b = 0x50; b <= 0x5F; b++) LDE_OK1[b] = 1;   /* push/pop reg */
+    for(k = 0; k < sizeof(ok1_noflag); k++) LDE_OK1[ok1_noflag[k]] = 1;
+    for(k = 0; k < sizeof(ok2_noflag); k++) LDE_OK2[ok2_noflag[k]] = 1;
+    LDE_OK1[0x82] = 0;                              /* invalid in long mode */
+  }
 
   LDE_INITED = 1;
 }
@@ -197,12 +226,17 @@ static int lde_decode(const uint8_t *p, size_t max, lde_inst_t *out) {
 
   /* Opcode */
   op = p[pos++];
+  if(!LDE_OK1[op]) return 0;
   flags = LDE_OP1[op];
+
+  /* A0-A3: MOV AL/eAX <-> moffs. 8-byte offset (4 with a 67 prefix). */
+  if(op >= 0xA0 && op <= 0xA3) pos += addr_size_32 ? 4 : 8;
 
   if(flags & LDE_F_ESC0F) {
     if(pos >= max) return 0;
     op2 = p[pos++];
     if(op2 == 0x38 || op2 == 0x3A) return 0;  /* 3-byte opcodes unsupported */
+    if(!LDE_OK2[op2]) return 0;
     is_0f = 1;
     flags = LDE_OP2[op2];
     op = op2;
@@ -370,7 +404,8 @@ static int pack_find_section(const pack_sec_t *sections, int n, uint32_t rva) {
 }
 
 /* Walk a section, collect cross-section RIP-rel / REL32 references.
-   Returns 0 on undecodable byte (caller should fall back).  */
+   Returns 0 on an undecodable byte, on a reference that leaves the code
+   sections, or on allocation failure. The caller must fail the build. */
 static int pack_find_refs(const uint8_t *map, pack_sec_t *sections, int n_sec,
                           int sec_idx, pack_ref_t **refs, int *n_refs, int *cap_refs)
 {
@@ -398,13 +433,27 @@ static int pack_find_refs(const uint8_t *map, pack_sec_t *sections, int n_sec,
       uint32_t inst_end_rva = sec->vaddr + pos + inst.length;
       uint32_t target_rva = inst_end_rva + (uint32_t)disp;
       int tgt_sec = pack_find_section(sections, n_sec, target_rva);
-      if(tgt_sec < 0 || tgt_sec == sec_idx) continue;
+      if(tgt_sec == sec_idx) continue;
+      if(tgt_sec < 0) {
+        /* One-past-the-end of the current section is still intra-section. */
+        if(target_rva == sec->vaddr + sec->vsize) continue;
+        /* Anything else points at data or imports that are not carried
+           into the blob, so the displacement would be wrong at runtime. */
+        printf("  [   packer: '%s'+0x%x references RVA 0x%x outside every code section\n",
+               sec->name, pos, target_rva);
+        return 0;
+      }
 
       /* Cross-section ref */
       if(*n_refs == *cap_refs) {
         int new_cap = (*cap_refs) * 2;
         if(new_cap == 0) new_cap = 32;
-        *refs = (pack_ref_t*)realloc(*refs, new_cap * sizeof(pack_ref_t));
+        pack_ref_t *grown = (pack_ref_t*)realloc(*refs, new_cap * sizeof(pack_ref_t));
+        if(grown == NULL) {
+          printf("  [   packer: out of memory growing ref table\n");
+          return 0;
+        }
+        *refs = grown;
         *cap_refs = new_cap;
       }
       pack_ref_t *r = &(*refs)[(*n_refs)++];
@@ -484,7 +533,7 @@ static void pack_search(int *cur, int depth, int n, int *used,
 }
 
 /* Main packer entry. Returns malloced packed blob and sets *out_size,
-   or NULL on failure (caller falls back to NOP-fill extraction).
+   or NULL on failure (the caller must fail the build).
 
    out_refs / out_n_refs (optional, pass NULL to discard): on success,
    the caller receives ownership of a malloced pack_ref_t[] recording
@@ -510,7 +559,7 @@ static uint8_t *pack_extract(const uint8_t *map, pack_sec_t *sections, int n_sec
   printf("  [ packer: walking %d code section(s) for cross-section refs\n", n_sec);
   for(i = 0; i < n_sec; i++) {
     if(!pack_find_refs(map, sections, n_sec, i, &refs, &n_refs, &cap_refs)) {
-      printf("  [ packer: LDE failed in section '%s' - falling back\n",
+      printf("  [ packer: failed in section '%s'\n",
              sections[i].name);
       free(refs);
       return NULL;
@@ -518,11 +567,24 @@ static uint8_t *pack_extract(const uint8_t *map, pack_sec_t *sections, int n_sec
   }
   printf("  [ packer: %d cross-section reference(s) found\n", n_refs);
 
-  /* Plan layout: enumerate permutations of indices [1..n-1] */
+  /* Plan layout. Up to 8 movable sections: try every permutation.
+     Beyond that n! is not practical, so place largest-first instead. */
   order[0] = 0;
   for(i = 1; i < n_sec; i++) order[i] = i;
   used[0] = 1;
-  pack_search(order, 1, n_sec, used, sections, &best_size, best_order);
+  if(n_sec <= 9) {
+    pack_search(order, 1, n_sec, used, sections, &best_size, best_order);
+  } else {
+    for(i = 1; i < n_sec; i++) {
+      for(j = i + 1; j < n_sec; j++) {
+        if(sections[order[j]].vsize > sections[order[i]].vsize) {
+          int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+        }
+      }
+    }
+    memcpy(best_order, order, n_sec * sizeof(int));
+    best_size = pack_eval_layout(sections, best_order, n_sec);
+  }
   best_order[0] = 0;
   pack_apply_layout(sections, best_order, n_sec);
 

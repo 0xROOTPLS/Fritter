@@ -45,7 +45,7 @@
 
 void *Memset (void *ptr, int value, unsigned int num);
 
-#define MARU_MAX_STR  64
+#define MARU_MAX_STR  1024   // bound on the scan, far above any export name
 #define MARU_BLK_LEN  16
 #define MARU_HASH_LEN  8
 #define MARU_IV_LEN    MARU_HASH_LEN
@@ -64,6 +64,16 @@ void *Memset (void *ptr, int value, unsigned int num);
 #define HASH_ROUNDS 31
 #endif
 
+#ifndef SUM_MUL
+#define SUM_MUL  0x01000193u
+#endif
+#ifndef SUM_SEED
+#define SUM_SEED 0x811C9DC5u
+#endif
+#ifndef SUM_ROT
+#define SUM_ROT  5
+#endif
+
 #ifndef ROTR32
 #define ROTR32(v,n)(((v)>>(n))|((v)<<(32-(n))))
 #endif
@@ -77,6 +87,7 @@ extern "C" {
 #endif
 
 uint64_t maru(const void *api, uint64_t iv);
+uint32_t mod_sum(const void *data, uint32_t len);
 
 #ifdef __cplusplus
 }

@@ -1,3 +1,5 @@
+> Historical design proposal. N>1 per-function dispatch has since shipped on both MSVC and gcc; see README and CHANGELOG for current behaviour.
+
 # Function-Granular Dispatch, Design Proposal
 
 **Status:** v1 (whole-loader, N=1) SHIPPED 2026-07-30. Per-function

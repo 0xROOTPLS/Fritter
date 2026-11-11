@@ -10,9 +10,8 @@
  * one section. Use this to co-locate tight caller-callee chains so
  * the call doesn't cross a page boundary.
  *
- * MSVC only: under gcc/mingw the macro is a no-op (the single-.text
- * + -fno-toplevel-reorder layout produced by the existing build
- * has not exposed the cross-page-loop bug in practice). */
+ * MSVC uses code_seg; gcc/mingw uses a section attribute. noinline
+ * keeps gcc from folding a tagged function into a resident caller. */
 
 #ifndef FRITTER_POLY_SECTION_H
 #define FRITTER_POLY_SECTION_H
@@ -23,7 +22,7 @@
 #ifdef _MSC_VER
 #  define LOADER_FN_SECTION(name_str) __declspec(code_seg(name_str))
 #else
-#  define LOADER_FN_SECTION(name_str)
+#  define LOADER_FN_SECTION(name_str) __attribute__((section(name_str), noinline))
 #endif
 
 #endif /* FRITTER_POLY_SECTION_H */

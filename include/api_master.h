@@ -30,7 +30,7 @@ XAPI(KERNEL32_DLL, "GetUserDefaultLCID",          GetUserDefaultLCID_t,         
 XAPI(KERNEL32_DLL, "WaitForSingleObject",         WaitForSingleObject_t,         WaitForSingleObject)
 XAPI(KERNEL32_DLL, "CreateThread",                CreateThread_t,                CreateThread)
 XAPI(KERNEL32_DLL, "CreateFileA",                 CreateFileA_t,                 CreateFileA)
-XAPI(KERNEL32_DLL, "GetFileSizeEx",               GetFileSizeEx_t,               GetFileSizeEx)
+XAPI(KERNEL32_DLL, "LocalFree",                   LocalFree_t,                   LocalFree)
 XAPI(KERNEL32_DLL, "GetThreadContext",            GetThreadContext_t,            GetThreadContext)
 XAPI(KERNEL32_DLL, "GetCurrentThread",            GetCurrentThread_t,            GetCurrentThread)
 XAPI(KERNEL32_DLL, "GetCurrentProcess",           GetCurrentProcess_t,           GetCurrentProcess)
@@ -42,6 +42,12 @@ XAPI(KERNEL32_DLL, "GetProcessHeap",              GetProcessHeap_t,             
 XAPI(KERNEL32_DLL, "HeapFree",                    HeapFree_t,                    HeapFree)
 XAPI(KERNEL32_DLL, "GetLastError",                GetLastError_t,                GetLastError)
 XAPI(KERNEL32_DLL, "CloseHandle",                 CloseHandle_t,                 CloseHandle)
+XAPI(KERNEL32_DLL, "ExitProcess",                 ExitProcess_t,                 ExitProcess)
+XAPI(KERNEL32_DLL, "TerminateProcess",            TerminateProcess_t,            TerminateProcess)
+
+XAPI(KERNELBASE_DLL, "GetProcessMitigationPolicy", GetProcessMitigationPolicy_t,  GetProcessMitigationPolicy)
+XAPI(KERNELBASE_DLL, "VirtualAlloc2",             VirtualAlloc2_t,               VirtualAlloc2)
+XAPI(KERNELBASE_DLL, "MapViewOfFile3",            MapViewOfFile3_t,              MapViewOfFile3)
 
 XAPI(SHELL32_DLL,  "CommandLineToArgvW",          CommandLineToArgvW_t,          CommandLineToArgvW)
 
@@ -54,17 +60,6 @@ XAPI(OLEAUT32_DLL, "SafeArrayGetUBound",          SafeArrayGetUBound_t,         
 XAPI(OLEAUT32_DLL, "SysAllocString",              SysAllocString_t,              SysAllocString)
 XAPI(OLEAUT32_DLL, "SysFreeString",               SysFreeString_t,               SysFreeString)
 XAPI(OLEAUT32_DLL, "LoadTypeLib",                 LoadTypeLib_t,                 LoadTypeLib)
-
-XAPI(WININET_DLL,  "InternetCrackUrlA",           InternetCrackUrl_t,            InternetCrackUrl)
-XAPI(WININET_DLL,  "InternetOpenA",               InternetOpen_t,                InternetOpen)
-XAPI(WININET_DLL,  "InternetConnectA",            InternetConnect_t,             InternetConnect)
-XAPI(WININET_DLL,  "InternetSetOptionA",          InternetSetOption_t,           InternetSetOption)
-XAPI(WININET_DLL,  "InternetReadFile",            InternetReadFile_t,            InternetReadFile)
-XAPI(WININET_DLL,  "InternetCloseHandle",         InternetCloseHandle_t,         InternetCloseHandle)
-XAPI(WININET_DLL,  "InternetQueryDataAvailable",  InternetQueryDataAvailable_t,  InternetQueryDataAvailable)
-XAPI(WININET_DLL,  "HttpOpenRequestA",            HttpOpenRequest_t,             HttpOpenRequest)
-XAPI(WININET_DLL,  "HttpSendRequestA",            HttpSendRequest_t,             HttpSendRequest)
-XAPI(WININET_DLL,  "HttpQueryInfoA",              HttpQueryInfo_t,               HttpQueryInfo)
 
 XAPI(MSCOREE_DLL,  "CorBindToRuntime",            CorBindToRuntime_t,            CorBindToRuntime)
 XAPI(MSCOREE_DLL,  "CLRCreateInstance",           CLRCreateInstance_t,           CLRCreateInstance)
@@ -84,3 +79,7 @@ XAPI(NTDLL_DLL,    "NtContinue",                  NtContinue_t,                 
 XAPI(NTDLL_DLL,    "NtCreateSection",             NtCreateSection_t,             NtCreateSection)
 XAPI(NTDLL_DLL,    "NtMapViewOfSection",          NtMapViewOfSection_t,          NtMapViewOfSection)
 XAPI(NTDLL_DLL,    "NtUnmapViewOfSection",        NtUnmapViewOfSection_t,        NtUnmapViewOfSection)
+XAPI(NTDLL_DLL,    "RtlAddFunctionTable",         RtlAddFunctionTable_t,         RtlAddFunctionTable)
+XAPI(NTDLL_DLL,    "RtlDeleteFunctionTable",      RtlDeleteFunctionTable_t,      RtlDeleteFunctionTable)
+XAPI(NTDLL_DLL,    "RtlCaptureContext",           RtlCaptureContext_t,           RtlCaptureContext)
+XAPI(NTDLL_DLL,    "RtlRestoreContext",           RtlRestoreContext_t,           RtlRestoreContext)
