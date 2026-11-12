@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/fritter-banner.gif" alt="Fritter banner">
+</p>
+
 # Fritter
 
 The evasive cousin of [Donut](https://github.com/TheWover/donut).
